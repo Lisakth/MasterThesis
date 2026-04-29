@@ -1,0 +1,1940 @@
+---
+title: "Munge"
+output: html_notebook
+---
+
+# Aims
+
+Let's extract the data from the datasheets for the first set of Yale UCB-J data.
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(kinfitr)
+library(naniar)
+library(lubridate)
+library(mgcv)
+library(gratia)
+library(glue)
+library(cowplot)
+library(stringr)
+
+#for SiMBA prep
+library(bloodstream)
+library(brms)
+library(rstan)
+library(furrr)
+library(ggcorrplot2)
+#remotes::install_github("caijun/ggcorrplot2")
+#devtools::install_github("mathesong/relfeas")
+#library(relfeas)
+#library(devtools)
+library(readxl)
+```
+
+# Demographics
+
+Should i include tracer, diagnosis and secondary diagnosis, patient state (pre, post, test)
+```{r}
+demog <- read_excel("/home/lisatjarks/Repositories/Yale_data/RawData/InjectionInfo/PETInjectionInformation.xlsx",
+                    sheet = "all_protocols_combined") %>% 
+  select(ID = PatientID,
+         PET = InjectionID,
+         Age = age,
+         Sex = sex,
+         Weight = weight,
+         InjRad = dose_MBq,
+         fP = free_fraction_number) %>% 
+  mutate(InjRad_SUV = InjRad / Weight)
+
+saveRDS(demog, "/home/lisatjarks/Repositories/Yale_data/DerivedData/Data1_demographics.rds")
+```
+
+```{r}
+demog <- readRDS("/home/lisatjarks/Repositories/Yale_data/DerivedData/Data1_demographics.rds") %>%
+  mutate(IDPET = paste(ID,PET,sep="_"))%>%
+  group_by(IDPET) %>%
+  nest(.key="demog")
+```
+
+
+# Data Sheets
+
+```{r}
+dat <- tibble(
+  filename = list.files("/home/lisatjarks/Repositories/Yale_data/RawData/all_data/", pattern="csv",
+                        full.names = T)) %>% 
+  mutate(Type = case_when(
+    str_detect(filename, "All_TACs_all") ~ "TAC",
+    str_detect(filename, "InputFunction") ~ "AIF",
+    str_detect(filename, "WholeBlood") ~ "WB",
+    str_detect(filename, "Plasma") ~"PLASMA",
+    str_detect(filename,"FittedParentFraction") ~"PARENT"))
+```
+
+## Plasma (after 3min)
+the the last columns did not have a header anymore, so finding the actual amount of headers that we need (amount , in the last col +1)
+pasting the values in the next col
+same header structure as before, starting with v14
+
+```{r}
+plasmadat <- dat %>%
+  filter(Type=="PLASMA") %>%
+  mutate(plasma = map(filename, read_csv, show_col_types = FALSE))%>%
+  mutate(plasma = map(plasma, ~{
+  last_col_name <- names(.x)[ncol(.x)]
+  
+  # count max splits needed
+  max_splits <- max(str_count(.x[[last_col_name]], ","), na.rm = TRUE) + 1
+  
+  .x %>%
+    separate(last_col_name,
+             into = paste0("v", (14):(13 + max_splits)),
+             sep = ",",
+             fill = "right",
+             extra = "drop")
+}))
+  
+```
+
+```{r}
+plasmadat_final <- plasmadat %>%
+  filter(Type=="PLASMA") %>%
+  mutate(plasma = map(plasma, ~{
+  minutes_pos <- which(names(.x) == "Unit")
+  .x %>%
+    mutate(across((minutes_pos + 1):ncol(.x), as.character)) %>%
+    pivot_longer(
+      cols = (minutes_pos + 1):ncol(.x),  # all columns after 'Unit'
+      names_to = "col",
+      values_to = "value"
+    ) %>%
+    pivot_wider(id_cols = c(PATIENTID, INJECTIONID, PSTATE,PROTOCOL, col),
+                names_from = Variable,
+                values_from = value) %>%
+    rename (Time = t, PLASMA = y1)%>%
+    mutate(Time = as.numeric(Time),
+           PLASMA = as.numeric(PLASMA)/1000) %>%
+    mutate(Time= ifelse(Time>=120,120,Time)) %>% 
+    select(-col)
+})) %>%
+  unnest(plasma) %>%
+  filter(!is.na(PLASMA) & PLASMA != "") %>%
+  mutate(IDPET=paste(PATIENTID,INJECTIONID,sep="_")) %>%
+  select(-Type, -filename,-PATIENTID,-INJECTIONID) %>%
+  group_by(IDPET,PROTOCOL) %>%
+  nest(.key="plasma")
+```
+
+## Parent (fitted)
+
+```{r}
+parentdat <- dat %>%
+  filter(Type=="PARENT") %>%
+  mutate(parent = map(filename, read_csv, show_col_types = FALSE))%>%
+  mutate(parent = map(parent, ~{
+  minutes_pos <- which(names(.x) == "minutes")
+  .x %>%
+    pivot_longer(
+      cols = (minutes_pos + 1):ncol(.x),  # all columns after 'minutes'
+      names_to = "Time",
+      values_to = "PARENT"
+    ) %>%
+    mutate(Time = as.numeric(Time))
+})) %>%
+    unnest(parent) %>%
+    mutate(IDPET=paste(PATIENTID,INJECTIONID,sep="_")) %>%
+    select(IDPET,Time, PARENT) %>%
+    group_by(IDPET) %>% 
+    nest(.key="parent")
+```
+
+just double checking that we do not have several AnalysisIDs for the same PET/ID. if empty, id say its uniquely identifiable
+
+```{r}
+# check <- parentdat %>%
+#   unnest(parent) %>%
+#   ungroup() %>%
+#   #group_by(PET, ID) %>%
+#   summarise(n_distinct_col3 = n_distinct(ANALYSISID), .by = c(PET,ID)) %>%
+#   filter(n_distinct_col3 > 1)
+```
+
+## AIF
+### AIF_calc (after 3min)
+AIF_calc=Parent*Plasma
+Goal is to calculate the AIF myself since it looks interpolated after around 5-10 minutes
+
+just a little note:
+- ANALYSISID in plasmadat and parentdat do not match which is why i excluded it 
+
+```{r}
+data_parentplasma <- parentdat %>%
+  inner_join(plasmadat_final) %>%
+  mutate(combined = map2(plasma, parent, ~{
+    parent_interp <- approx(
+      x = .y$Time,
+      y = .y$PARENT,
+      xout = .x$Time,
+      method = "linear"
+    )
+    
+    # combine with plasma data
+    .x %>%
+      mutate(PARENT = parent_interp$y)
+  })) %>%
+  select(IDPET,PROTOCOL,combined) %>%
+  unnest(combined) %>%
+  mutate(PLASMA =as.numeric(PLASMA),
+         PARENT =as.numeric(PARENT),
+         AIF_calc=PLASMA*PARENT) %>%
+  filter(!is.na(AIF_calc)) %>% 
+  group_by(IDPET,PROTOCOL) %>%
+  nest(.key="aif_calc")
+```
+
+
+
+### AIF ("fitted" that look raw)
+
+Here I'll take the fitted AIF, and convert it to MBq.
+
+```{r}
+aifdat <- dat %>% 
+  filter(Type=="AIF") %>% 
+  mutate(aif = map(filename, read_csv, show_col_types = FALSE)) %>% 
+  mutate(aif = map(aif, ~{
+  minutes_pos <- which(names(.x) == "minutes")
+  .x %>%
+    pivot_longer(
+      cols = (minutes_pos + 1):ncol(.x),  # all columns after 'minutes'
+      names_to = "Time",
+      values_to = "AIF"
+    ) %>%
+    mutate(Time = as.numeric(Time),
+           AIF = ifelse(is.na(AIF),0,AIF / 1000))
+})) %>%
+    unnest(aif) %>%
+    mutate(IDPET = paste(PATIENTID,INJECTIONID,sep="_")) %>%
+    select(-PATIENTID, -INJECTIONID) %>%
+    group_by(IDPET) %>% 
+    nest(.key="aif")
+```
+
+
+Let's plot a couple to be sure
+
+```{r}
+  
+aifdat %>% filter(ID == "DD191", PET=="12227") %>% 
+  unnest(aif) %>%
+  ggplot(aes(x=Time, y=AIF)) +
+  geom_point() +
+  geom_line() +
+  xlim(0,10)
+
+
+ggplot(aifdat$aif[[2]], aes(x=Time, y=AIF)) +
+  geom_point() +
+  geom_line() +
+  xlim(0,10) + 
+  scale_x_log10()
+```
+
+note: since it looks kind of fitted after 3 minutes, and we have the data for all plasma and parent after 3 minutes, we start there to calculate our own AIF
+
+
+
+### Join (/10min)
+
+joining aif and self calculated aif to get the best out of all worlds
+
+```{r}
+data_aif_combined <- data_parentplasma %>%
+  inner_join(aifdat, by = join_by(IDPET)) %>%
+  mutate(aif=map(aif, ~.x %>% filter(as.numeric(Time)<10) %>%
+                   select(Time, AIF))) %>%
+  mutate(aif_calc=map(aif_calc, ~.x %>% filter(as.numeric(Time)>10) %>%
+                        rename(AIF = AIF_calc) %>%
+                    select(Time, AIF))) %>% #, PARENT, PLASMA
+  mutate(combined = map2(aif, aif_calc, ~bind_rows(.x, .y))) %>%
+  select(-aif, -aif_calc) %>%
+  unnest(combined) %>%
+  mutate(AIF = as.numeric(AIF),
+         Time = as.numeric(Time)) %>%
+  arrange(IDPET, Time) %>%
+  group_by(IDPET,PROTOCOL) %>%
+  nest(.key="aif") %>%
+  ungroup()
+  
+```
+
+### FengConv -> aif_data
+
+
+```{r}
+# Extract Data
+aif_data <- data_aif_combined %>%
+  ungroup() %>% 
+  select(IDPET, aif) %>% 
+  mutate(aif = map(aif, ~.x %>% 
+                     rename(time= Time,
+                            aif = AIF) %>%
+                     ungroup() %>% 
+                     mutate(Method = "Discrete"))) 
+
+aif_data <- aif_data %>%
+  mutate(aif_fit = map(aif, ~blmod_fengconv(time = .x$time, activity = .x$aif)))
+
+# Make Predictions
+mintime <- 0
+maxtime <- max(map_dbl(aif_data$aif, ~max(.x$time)))
+predtimes <- seq(from=mintime, to=maxtime, length.out=6000)
+
+aif_data <- aif_data %>%
+  mutate(preds = map(aif_fit, ~tibble(
+    time = predtimes) %>%
+      mutate(aif = predict(.x, newdata=list(time=time)))))
+
+# Plot
+pmap(list(aif_data$aif, aif_data$preds, aif_data$IDPET), plot_aif_preds)
+
+```
+
+### Feng
+
+```{r}
+aif_data_feng <- data_aif_combined %>%
+  ungroup() %>% 
+  select(IDPET, aif) %>% 
+  mutate(aif = map(aif, ~.x %>% 
+                     rename(time= Time,
+                            aif = AIF) %>%
+                     ungroup() %>% 
+                     mutate(Method = "Discrete"))) 
+
+aif_data_feng <- aif_data_feng %>%
+  mutate(aif_fit = map(aif, ~blmod_feng(time = .x$time, activity = .x$aif)))
+
+# Make Predictions
+mintime <- 0
+maxtime <- max(map_dbl(aif_data_feng$aif, ~max(.x$time)))
+predtimes <- seq(from=mintime, to=maxtime, length.out=6000)
+
+aif_data_feng <- aif_data_feng %>%
+  mutate(preds = map(aif_fit, ~tibble(
+    time = predtimes) %>%
+      mutate(aif = predict(.x, newdata=list(time=time)))))
+
+# Plot
+pmap(list(aif_data_feng$aif, aif_data_feng$preds, aif_data_feng$IDPET), plot_aif_preds)
+```
+
+### Plot AIF, Feng, FengConv
+
+```{r}
+aif_data_plot <- aif_data %>% 
+  slice(5) %>% 
+  rename(preds_FC = preds) %>% 
+  select(preds_FC, IDPET, aif) %>% 
+  left_join(aif_data_feng)
+```
+
+```{r}
+plot_aif_intro <- ggplot() +
+  geom_point(data = aif_data_plot %>% ungroup() %>% select(aif) %>% unnest(aif) %>% ungroup(), 
+             aes(x = time, y = aif, colour = "Arterial blood samples")) +
+  geom_line(data = aif_data_plot %>% ungroup() %>% select(preds_FC) %>% unnest(preds_FC) %>% ungroup(), 
+            aes(x = time, y = aif, colour = "AIF with FengConv")) +
+  geom_line(data = aif_data_plot %>% ungroup() %>% select(preds) %>% unnest(preds) %>% ungroup(), 
+            aes(x = time, y = aif, colour = "AIF with Feng")) +
+  scale_color_manual(
+    values = c(
+      "Arterial blood samples" = "black",
+      "AIF using FengConv"      = "blue",
+      "AIF using Feng"          = "red"
+    )
+  ) +
+  xlim(0, 10) + 
+  labs(title = "Arterial input functions (for one subject)",
+       colour = "",
+       x = "Time (in minutes)",
+       y = "Radioligand concentration (in MBq)")
+
+plot_aif_intro
+ggsave("aifIntro.pdf", plot = plot_aif_intro, width = 10, height = 7, dpi = 300)
+```
+
+## WB (after 3 min)
+
+Here I'll take the WB, and convert it to MBq.
+
+```{r}
+wbdat <- dat %>% 
+  filter(Type=="WB") %>% 
+  mutate(wb = map(filename, read_csv, show_col_types = FALSE)) %>% 
+  mutate(wb = map(wb, ~{
+  minutes_pos <- which(names(.x) == "Unit")
+  .x %>%
+    mutate(across((minutes_pos + 1):ncol(.x), as.character)) %>%
+    pivot_longer(
+      cols = (minutes_pos + 1):ncol(.x),  # all columns after 'Unit'
+      names_to = "col",
+      values_to = "value"
+    ) %>%
+    pivot_wider(id_cols = c(PATIENTID, INJECTIONID, PSTATE, col),
+                names_from = Variable,
+                values_from = value) %>%
+    rename (Time = t, WB = y1)%>%
+    mutate(Time = as.numeric(Time),
+           WB = as.numeric(WB) / 1000) %>%
+    select(-col)
+})) %>%
+    unnest(wb) %>%
+    ungroup() %>%
+    mutate(IDPET = paste(PATIENTID,INJECTIONID, sep="_")) %>%
+    select(-Type, -filename,-PATIENTID,-INJECTIONID) %>%
+    filter(!is.na(Time) & !is.na(WB)) %>%
+    group_by(IDPET,PSTATE) %>% 
+    nest(.key="wb") %>%
+    mutate(wb = map(wb, ~{
+      .x %>%
+        group_by(Time) %>%
+        summarise(WB = mean(WB, na.rm = TRUE)) %>%
+        ungroup()
+    })) %>%
+    unnest(wb) %>%
+    ungroup() %>%
+    group_by(IDPET,PSTATE) %>% 
+    nest(.key="wb") %>%
+    ungroup()
+```
+
+Let's plot a couple to be sure
+
+```{r}
+ggplot(wbdat$wb[[1]], aes(x=Time, y=WB)) +
+  geom_point() +
+  geom_line()
+
+ggplot(wbdat$wb[[2]], aes(x=Time, y=WB)) +
+  geom_point() +
+  geom_line()
+```
+
+## BPR
+
+### calc (after 3 min)
+
+```{r}
+data_BPR <- wbdat %>%
+  inner_join(data_parentplasma) %>% 
+  mutate(aif_calc=map(aif_calc, ~.x %>%
+                    select(Time, PLASMA))) %>%
+  mutate(combined = map2(aif_calc, wb, ~left_join(.x, .y, by = "Time"))) %>%
+  select(IDPET,combined) %>%
+  unnest(combined) %>%
+  ungroup() %>%
+  rename(time=Time) %>%
+  mutate(bpr=WB/PLASMA) %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+### Fitted (after 3 min)
+
+```{r}
+# Fit Model
+
+bpr_hgam_fit <- mgcv::gam(
+  formula = as.formula(bpr ~ s(time, k=8) + s(time, IDPET, bs='fs', k=5)),
+  data    = data_BPR,
+  method  = "REML",
+  family  = scat()
+)
+
+# Diagnostics
+k.check(bpr_hgam_fit)
+```
+
+```{r}
+appraise(bpr_hgam_fit)
+```
+
+```{r}
+data_BPR_nested <- data_BPR %>%
+  group_by(IDPET) %>%
+  nest(.key="bpr")
+```
+
+### Preds
+
+```{r}
+# Make Predictions
+mintime <- 0
+maxtime <- max(map_dbl(data_BPR_nested$bpr, ~max(.x$time)))
+predtimes <- seq(from=mintime, to=maxtime, length.out=1000)
+
+# hgam_preds <- tidyr::expand_grid(data_BPR_nested,
+#                                  time = predtimes)
+hgam_preds <- tidyr::expand_grid(
+  data_aif_combined %>% select(IDPET),
+  time = predtimes
+)
+
+hgam_preds <- gratia::fitted_values(bpr_hgam_fit, data=hgam_preds) %>% 
+  rename(bpr = .fitted) 
+
+bpr_data <- inner_join(data_BPR_nested,
+                      hgam_preds %>% 
+                      group_by(IDPET) %>% 
+                      nest(preds = -IDPET))
+
+# Plot
+pmap(list(bpr_data$bpr, bpr_data$preds, bpr_data$IDPET), plot_bpr_preds)
+```
+
+## Plasma, Blood 
+
+### calc
+
+```{r}
+# Plasma = AIF / ParentFraction
+# Blood = Plasma * BPR
+input_calc <- data_aif_combined %>% 
+  inner_join(parentdat) %>%
+  mutate(parent = map2(aif, parent, ~{
+    parent_interp <- approx(
+      x = .y$Time,
+      y = .y$PARENT,
+      xout = .x$Time,
+      method = "linear"
+    )
+    .x %>%
+      mutate(PARENT = parent_interp$y) %>%
+      select(Time,PARENT)
+  })) %>%
+  inner_join(bpr_data) %>%
+  mutate(bpr = map2(aif, preds, ~{
+    bpr_interp <- approx(
+      x = .y$time,
+      y = .y$bpr,
+      xout = .x$Time,
+      method = "linear"
+    )
+    .x %>%
+      mutate(BPR = bpr_interp$y) %>%
+      select(Time,BPR)
+  })) %>%
+  select(-preds) %>% 
+  mutate(plasma_calc = map2(aif,parent, ~{
+    left_join(.x, .y, by = "Time") %>%
+      mutate(PLASMA = AIF/PARENT) %>%
+      select(Time, PLASMA)
+  })) %>%
+  mutate(blood_calc = pmap(list(aif,parent,bpr), ~{
+    left_join(..1, ..2, by = "Time") %>%
+      left_join(..3, by = "Time") %>%
+      mutate(WB = AIF/PARENT*BPR) %>%
+      select(Time, WB)
+  }))
+  
+```
+
+### Join (/~3 min)
+
+```{r}
+plasma_blood_combined <- input_calc %>%
+  select(-PROTOCOL) %>% 
+  inner_join(plasmadat_final, by = join_by(IDPET)) %>%
+  select(-PROTOCOL) %>% 
+  mutate(plasma_comb = map2(plasma_calc, plasma, ~{
+    smallest_time_raw_data <- min(.y$Time)
+    bind_rows(.y %>% select(Time,PLASMA), .x %>% 
+      filter(as.numeric(Time)<smallest_time_raw_data) %>% 
+        select(Time,PLASMA)) %>% 
+      arrange(Time)
+  })) %>% 
+  inner_join(wbdat, by = join_by(IDPET)) %>%
+  mutate(blood_comb = map2(blood_calc, wb, ~{
+    smallest_time_raw_data <- min(.y$Time)
+    bind_rows(.y %>% select(Time,WB), .x %>% 
+      filter(as.numeric(Time)<smallest_time_raw_data) %>% 
+        select(Time,WB)) %>% 
+      arrange(Time)
+  })) %>%
+  select(IDPET,plasma_comb,blood_comb) %>%
+  rename(plasma = plasma_comb,
+         blood = blood_comb)
+```
+
+## input (blood_interp)
+
+```{r}
+input <- plasma_blood_combined %>%
+  inner_join(aif_data) %>%
+  inner_join(parentdat) %>%
+  select(-aif, -aif_fit) %>%
+  rename(aif = preds) 
+
+df_input <- input %>%
+  mutate(input_wrong = pmap(list(aif, parent, plasma, blood), ~{
+    
+    blood_interp(
+      t_blood      = ..4$Time,
+      blood        = ..4$WB,
+      t_plasma     = ..3$Time,
+      plasma       = ..3$PLASMA,
+      t_parentfrac = ..2$Time,
+      parentfrac   = ..2$PARENT#,
+      #t_aif        = aif_trimmed$time,
+      #aif          = aif_trimmed$aif
+    )
+  })) %>% 
+  mutate(aif=map(aif, ~.x %>% 
+                   rename(Time=time))) %>% 
+  mutate(input = map2(input_wrong, aif, ~{
+    left_join(.x, .y, by = "Time") %>%
+      mutate(AIF_new= ifelse(is.na(aif),AIF,aif)) %>% 
+      select(-AIF, -aif) %>% 
+      rename(AIF=AIF_new)
+  })) %>% 
+  select(-input_wrong)
+
+saveRDS(df_input, "/home/lisatjarks/Repositories/Yale_data/DerivedData/input.rds")
+
+```
+
+```{r}
+input <- readRDS("../DerivedData/input.rds")
+```
+
+
+
+## TACs
+
+Here I'll extract the TACs, and convert to MBq.
+
+```{r}
+tac <- dat %>% 
+  filter(Type=="TAC") %>% 
+  mutate(tac = map(filename, read_csv, show_col_types = FALSE)) %>% 
+  mutate(tac = map(tac, ~{
+  minutes_pos <- which(names(.x) == "Unit")
+  .x %>%
+    mutate(ROIsize = case_when(
+      !is.na(as.numeric(FINAL_ROI_VOLUME)) ~ as.numeric(FINAL_ROI_VOLUME),  # ROIsize is already numeric
+      !is.na(as.numeric(VARIABLEUNITS)) ~ as.numeric(VARIABLEUNITS),  # ROIsize value in wrong column
+      TRUE ~ NA_real_ )) %>%
+    mutate(across((minutes_pos + 1):ncol(.x), as.character)) %>%
+    pivot_longer(
+      cols = (minutes_pos + 1):ncol(.x),  # all columns after 'Unit'
+      names_to = "col",
+      values_to = "value"
+    ) %>%
+    pivot_wider(id_cols = c(PATIENTID, INJECTIONID,CURVENAME, ANALYSISID, ROIsize,PSTATE, PROTOCOL, SECONDARY_DIAGNOSIS, Seriesdescription, SERIESID, col),
+                names_from = Variable,
+                values_from = value) %>%
+    rename (frame_mid = t, TAC = y1) %>%
+    mutate(frame_mid = as.numeric(frame_mid),
+           TAC = as.numeric(TAC) / 1000) %>%
+    filter(!is.na(frame_mid)) %>% 
+    select(-col)
+})) %>%
+    unnest(tac) %>%
+    mutate(IDPET = paste(PATIENTID,INJECTIONID, sep="_")) %>%
+    mutate(frame_mid = ifelse(
+      IDPET == "LC224_12839" & abs(frame_mid - round(frame_mid, 2)) < 1e-4,
+      round(frame_mid, 2),
+      frame_mid
+    )) %>%
+    rename(Region = CURVENAME) %>%
+    select(-Type, -filename,-PATIENTID,-INJECTIONID) %>%
+    group_by(IDPET, PSTATE, SECONDARY_DIAGNOSIS,PROTOCOL) %>% 
+    nest(.key="tac") %>%
+    mutate(tac =map(tac, ~.x %>%
+                    group_by(Region, ANALYSISID,ROIsize,Seriesdescription,SERIESID) %>%
+                    nest(.key="tac_inside")))
+```
+
+### Genotypes (Nakul)
+
+```{r}
+genotypes <- tac %>% 
+  ungroup() %>% 
+  select(IDPET, SECONDARY_DIAGNOSIS) %>%
+  mutate(ID = str_extract(IDPET, "^[^_]+")) %>%
+  select(ID, SECONDARY_DIAGNOSIS) %>%
+  ungroup() %>% 
+  rename(Genotype = SECONDARY_DIAGNOSIS) %>%
+  mutate(Genotype= ifelse(str_detect(Genotype, "N/A")| str_detect(Genotype,"Major"),NA,Genotype)) %>% 
+  arrange(Genotype,ID) %>% 
+  distinct()
+```
+
+
+
+```{r}
+genotype_comb <- aifdat %>% 
+  ungroup() %>% 
+  mutate(ID = str_extract(IDPET, "^[^_]+")) %>%
+  select(ID) %>% 
+  inner_join(genotypes) %>%
+  mutate(Genotype= ifelse(str_detect(Genotype, "N/A")| str_detect(Genotype,"Major"),NA,Genotype)) %>% 
+  arrange(Genotype,ID) %>% 
+  select(Genotype,ID) %>% 
+  distinct() %>% 
+  rename(PATIENTID = ID)
+
+write.csv(genotype_comb, "Genotype.csv")
+```
+
+
+### durations
+preparing for SiMBA
+we need to check that the duration is not too far apart
+
+```{r}
+
+manual_ceiling(30.65, -5)  
+```
+
+
+```{r}
+#general structure of dataset tac:
+#we have here the data, with ID,PET,ANALYSISID,PSTATE,nest="tac" 
+    #nest="tac" including Region,ANALYSISID,ROIsize,nest="tac"
+      #nest="tac" including frame_mid, TAC
+
+manual_ceiling <- function(value, significance){
+  val <- ceiling(value / significance) * significance
+  return(val)
+}
+
+
+#this function gets data within one ID,one PET, but several regions
+#general idea: do that only for the first region within every PET/ID, 
+#this funtion: first region of this PET/ID, and then map this function to each PET/ID-pair
+calc_dur <- function(nested_tac){
+  
+  data <- nested_tac %>%
+    ungroup() %>%
+    slice(1) %>% #selecting first data point (calculating only for the first region)
+    unnest(tac_inside) %>%
+    mutate(frame_mid,
+           frame_start=0,
+           frame_end =120,
+           dur=NA)
+  
+  regular <- TRUE  # check flag
+  
+  # first frame
+  data$frame_start[1] <- data$frame_mid[1]-0.25
+  data$frame_end[1] <- data$frame_mid[1]+0.25
+  data$dur[1] <- 0.5
+  
+  for (i in 2:length(data$frame_mid)){
+    
+    # calculating dur, start and end 
+    calc_start <- case_when(
+      data$frame_mid[i] < 3  ~ manual_ceiling(data$frame_mid[i], -0.5),
+      data$frame_mid[i] < 6  ~ manual_ceiling(data$frame_mid[i], -1),
+      data$frame_mid[i] < 10 ~ manual_ceiling(data$frame_mid[i], -2),
+      TRUE                   ~ manual_ceiling(data$frame_mid[i], -5)
+    )
+    
+    calc_end <- case_when(
+      data$frame_mid[i] < 3  ~ manual_ceiling(data$frame_mid[i], 0.5),
+      data$frame_mid[i] < 6  ~ manual_ceiling(data$frame_mid[i], 1),
+      data$frame_mid[i] < 10 ~ manual_ceiling(data$frame_mid[i], 2),
+      TRUE                   ~ manual_ceiling(data$frame_mid[i], 5)
+    )
+    
+    # should just flag if the end[i-1] was different; meaning here we correct the start after an irregular frame
+    if (!(calc_start == data$frame_end[i-1]) | !(data$frame_mid[i] %% 0.25 == 0)){
+      regular <- FALSE
+    }
+    
+    data$frame_start[i] <- calc_start
+    data$frame_end[i] <- min(c(data$frame_start[i] + (data$frame_mid[i]-data$frame_start[i])*2 ,calc_end))
+    data$dur[i] <- data$frame_end[i] - data$frame_start[i]
+    
+    if (is.na(data$frame_mid[i+1])) break 
+  }
+  data <- data %>% 
+    filter(!is.na(dur)) %>%
+    ungroup() %>%
+    select(frame_mid,frame_start,frame_end,dur)
+  
+  if(any(data$dur == 0, na.rm = TRUE)) regular <- FALSE
+  
+  return(list(tacs_dur = data, regular = regular))
+}
+
+#apply that function for all the ID,PET pairs
+tac_dur <- tac %>%
+    mutate(result = map(tac, calc_dur),
+           tacs_dur = map(result, "tacs_dur"),
+           regular = map_lgl(result, "regular")) %>%
+    select(-result)
+```
+
+and then copy to other regions of same PET/ID
+  copy the duration also into the nests of the other regions
+
+```{r}
+tac_dur_final <- tac_dur %>%
+  mutate(tac = map2(tac, tacs_dur, ~ {
+    .x %>%
+      mutate(tac_inside = map(tac_inside, function(inner) {
+        left_join(inner, .y, by = "frame_mid")
+      }))
+  })) %>%
+  select(-tacs_dur)
+```
+
+filtering for the TACs where everything went fine
+
+```{r}
+tac_regular <- tac_dur_final %>%
+  filter(regular)
+tac_irregular <- tac_dur_final %>%
+  filter(!regular)
+```
+
+
+### Region
+#### cleaning
+
+```{r}
+data_roi <- tac_dur_final %>%
+  unnest(tac) %>%
+  ungroup() %>%
+  #select(ID,PET,ANALYSISID, ROIsize, Region) %>%
+  mutate(Region_spec =Region,
+         Region_spec = paste0(toupper(substr(Region_spec, 1, 1)), substr(Region_spec, 2, nchar(Region_spec))),
+         Region = ifelse(str_detect(Region, "semiovale"), "C_semiovale", ifelse(str_detect(Region, "insula"),"Insula", str_extract(Region_spec, "^[^_]+"))),
+         Region = paste0(toupper(substr(Region, 1, 1)), substr(Region, 2, nchar(Region))),
+         variant_PVC = ifelse(str_detect(Region_spec,"PVC")|str_detect(Region_spec,"pvc"),TRUE,FALSE),
+         variant_WM = ifelse(str_detect(Region_spec,"WM")|str_detect(Region_spec,"wm"),TRUE,FALSE),
+         variant_GM = ifelse(str_detect(Region_spec,"GM")|str_detect(Region_spec,"gm"),TRUE,FALSE),
+         variant_PET = ifelse(str_detect(Region_spec,"PET")|str_detect(Region_spec,"pet"),TRUE,FALSE),
+         variant_SPM = ifelse(str_detect(Region_spec,"SPM")|str_detect(Region_spec,"spm"),TRUE,FALSE),
+         variant_ANT = ifelse(str_detect(Region_spec,"ANT")|str_detect(Region_spec,"ant")|str_detect(Region_spec,"Ant"),TRUE,FALSE),
+         variant_CAT = ifelse(str_detect(Region_spec,"CAT")|str_detect(Region_spec,"cat"),TRUE,FALSE),
+         variant_POST = ifelse(str_detect(Region_spec,"Post"),TRUE,FALSE)
+         )  %>%
+  mutate(Region = ifelse(variant_ANT,paste(Region,"Ant", sep = "_"),Region),
+         Region = ifelse(variant_POST,paste(Region,"Post", sep = "_"),Region)) %>%
+  select(-variant_ANT,-variant_POST) %>%
+  mutate(variant_regular = !if_any(variant_PVC:variant_CAT, ~ .))
+
+# table(data_roi$Region_spec)
+# table(data_roi$Region)
+```
+
+#### Analysis
+##### counts per Region
+
+```{r}
+data_roi_no_duplicates <- data_roi[!duplicated(data_roi[, c("IDPET", "Region_spec")]), ]
+
+long_data <-  data_roi_no_duplicates %>%
+  pivot_longer(
+    cols = starts_with("variant_"),
+    names_to = "variant",
+    values_to = "flag"
+  ) 
+
+data_counts <- long_data %>%
+  filter(flag) %>%                         # keeps true, which shoudl not change things here
+  group_by(variant, Region) %>%
+  summarise(n = n_distinct(IDPET), .groups = "drop")
+
+data_counts_wide <- data_counts %>%
+  pivot_wider(names_from = Region, values_from = n, values_fill = 0)
+data_counts_wide
+```
+
+##### no regular PET
+
+```{r}
+no_regular <- data_roi_no_duplicates %>%
+  group_by(IDPET, Region) %>%
+  filter(!any(variant_regular)) %>%
+  ungroup() %>%
+  group_by(Region) %>%
+  nest(.key = "missing")
+no_regular
+```
+
+##### regular
+
+```{r}
+regular <- data_roi %>%
+  group_by(IDPET, Region) %>%
+  filter(any(variant_regular)) %>%
+  filter(Region==Region_spec) %>%
+  mutate(count=n()) %>%
+  filter(count >= 2) %>%
+  ungroup() %>% 
+  group_by(IDPET,Region, Seriesdescription, SERIESID) %>%
+  nest(.key = "regular") %>%
+  ungroup() %>% 
+  filter(!str_detect(Seriesdescription, "pvc")) %>%
+  group_by(IDPET,Region) %>% 
+  mutate(count=n()) %>% 
+  filter(!count==1)
+```
+
+##### without pvc
+
+```{r}
+regular_new <- data_roi %>%
+  group_by(IDPET, Region) %>%
+  filter(any(variant_regular)) %>%
+  filter(Region==Region_spec) %>%
+  mutate(count=n()) %>%
+  filter(count >= 2) %>%
+  ungroup() %>% 
+  filter(!str_detect(Seriesdescription, "pvc")) %>%
+  group_by(IDPET,Region) %>% 
+  filter(!any(variant_regular)) %>%
+  ungroup() %>%
+  group_by(Region) %>%
+  nest(.key = "missing")
+regular_new
+```
+
+```{r}
+no_regular_new <- data_roi %>%
+  filter(!str_detect(Seriesdescription, "pvc")) %>%
+  group_by(IDPET, Region) %>%
+  filter(!any(variant_regular)) %>%
+  ungroup() %>%
+  group_by(Region) %>%
+  nest(.key = "missing")
+no_regular_new
+```
+
+##### doubled
+
+```{r}
+doubled <- data_roi %>%
+  group_by(IDPET, Region) %>%
+  filter(sum(variant_regular) >= 2) %>%
+  filter(variant_regular) %>%
+  ungroup() %>%
+  group_by(Region) %>%
+  nest(.key = "missing")
+doubled
+```
+
+#### ROImean
+
+getting a feeling for how big the variation between individuals
+```{r}
+data_roi %>%
+  filter(!str_detect(Region, "semiovale")) %>% 
+  filter(!variant_GM) %>% 
+  filter(!is.na(ROIsize)) %>%
+  group_by(Region_spec) %>%
+  summarise(mean_ROIsize = mean(as.numeric(ROIsize)),
+            min_val = min(ROIsize),
+            max_val = max(ROIsize))
+```
+
+ mean roi size onlz calculated on values from the vanilla regions
+ 
+```{r}
+ mean_roi <- data_roi %>%
+  filter(!str_detect(Seriesdescription, "pvc")) %>% 
+  filter(!is.na(ROIsize)) %>%
+  filter(Region==Region_spec) %>% 
+  group_by(Region) %>%
+  summarise(mean_ROIsize = mean(ROIsize))
+```
+
+join the mean roi to the data 
+
+```{r}
+data_roi_final <- data_roi %>% 
+  left_join(mean_roi, by = "Region") %>%
+  ungroup()
+```
+
+#### SUV for Region_spec
+
+```{r}
+# assuming data_roi_final already to be unnested
+data_SUV <- data_roi_final %>%
+  inner_join(demog) %>%
+  unnest(demog) %>%
+  select(IDPET, ANALYSISID, Region, Region_spec, InjRad_SUV, tac_inside) %>%
+  unnest(tac_inside)
+
+for (i in unique(data_SUV$Region)){
+   plot <- data_SUV %>% filter(Region==i) %>%
+  ggplot(aes(x = frame_mid, y = TAC/InjRad_SUV, colour = Region_spec)) +
+  geom_point() +
+  geom_line() +
+    labs(title = i)
+   
+   print(plot)
+}
+
+for (i in unique(data_SUV$Region)){
+  plot <- data_SUV %>% 
+    filter(Region == i) %>%
+    ggplot(aes(x = frame_mid, y = TAC/InjRad_SUV, 
+               colour = Region_spec, group = interaction(IDPET,ANALYSISID, Region_spec))) +
+    geom_point(alpha = 0.3, size = 0.8) +
+    geom_line(alpha = 0.5) +
+    labs(title = i) +
+    theme_minimal()
+  
+  print(plot)
+}
+```
+
+```{r}
+# assuming data_roi_final already to be unnested
+data_SUV_main_regions <- data_roi_final %>%
+  inner_join(demog) %>%
+  unnest(demog) %>%
+  select(IDPET, ANALYSISID, Region, Region_spec, InjRad_SUV, tac_inside) %>%
+  filter(Region==Region_spec) %>% 
+  group_by(IDPET,Region) %>%
+  mutate(count=n()) %>%
+  filter(count >= 2) %>%
+  ungroup() %>% 
+  slice(1:100) %>% 
+  unnest(tac_inside)
+
+for (i in unique(data_SUV$Region)){
+  plot <- data_SUV_main_regions %>% 
+    filter(Region == i) %>%
+    ggplot(aes(x = frame_mid, y = TAC/InjRad_SUV, 
+               colour = IDPET, group = interaction(IDPET,ANALYSISID))) +
+    geom_point(alpha = 0.3, size = 0.8) +
+    geom_line(alpha = 0.5) +
+    labs(title = i) +
+    theme_minimal()
+  
+  print(plot)
+}
+```
+
+#### final 9 Regions
+
+```{r}
+data_roi_final_regions <- data_roi_final %>% 
+  #choosing that i dont have duplicated Regions_specs
+  filter(!str_detect(Seriesdescription, "pvc")) %>% 
+  filter(!(IDPET=="LC224_12839" & Seriesdescription=="pbr28_motcor_mc")) %>% 
+  filter(!(IDPET=="PM790_15603" & Seriesdescription=="pbr28_2_motcor_mc")) %>% 
+  filter(!(IDPET=="LV675_6899" & Seriesdescription=="pbr28_vc2_mc")) %>% 
+  # just vanilla regions
+  filter(Region==Region_spec) %>% 
+  #choose only the ROIs of interest
+  filter(!Region=="Orbitofrontal", !Region=="Insula", !Region=="C_semiovale", !Region=="Caudate", !Region=="Hypothalamus",
+         !Region=="Cingulum_Ant")
+```
+
+```{r}
+table(data_roi_final_regions$Region)
+```
+
+joined with input that i know which data complete i have
+
+```{r}
+joined <- data_roi_final_regions %>% 
+  inner_join(input) %>% 
+  ungroup() %>% 
+  group_by(IDPET) %>% 
+  filter(!any(Region=="Amygdala"))
+table(joined$Region)
+```
+
+### plot tac
+
+```{r}
+tac_plot <- data_roi_final_regions %>% 
+  ungroup() %>% 
+  group_by(IDPET) %>% 
+  nest() %>% 
+  ungroup() %>% 
+  slice(5) %>% 
+  unnest(data) %>% 
+  unnest(tac_inside) %>% 
+  ggplot(aes(x = frame_mid, y = TAC, colour = Region)) + 
+   geom_point() +
+   geom_line() + 
+     labs(title = "Time Activity Curve (for one subject)",
+          colour = "Region of interest",
+          x= "Time (in minutes)",
+          y = "Radioligand concentration (in MBq)") 
+tac_plot
+ggsave("tacIntro.pdf", plot = tac_plot, width = 10, height = 7, dpi = 300)
+```
+
+### Weights
+
+```{r}
+tac_dur_weights <- data_roi_final_regions %>% 
+  mutate(tac_inside = map(tac_inside, ~.x %>%
+              mutate(TAC = as.numeric(TAC),
+                     frame_mid = as.numeric(frame_mid),
+                     weights = weights_create(tac = TAC,
+                                              t_start = frame_start,
+                                              t_end = frame_end,
+                                              radioisotope = "C11",
+                                              minweight = 0.3,
+                                              weight_checkn = 5)))) %>%
+  group_by(IDPET) %>%
+  nest(.key= "tac")
+
+#i think this is the same but not sure
+# tac_dur_weights <- data_roi_final %>% 
+#   unnest(tac_inside) %>%
+#   ungroup() %>%
+#   mutate(TAC = as.numeric(TAC),
+#          frame_mid = as.numeric(frame_mid)) %>%
+#   group_by(IDPET) %>% 
+#   nest(.key="tac") %>%
+#   ungroup() %>%
+#   mutate(tac = map(tac, ~.x %>% 
+#                                   mutate(weights = weights_create(tac = TAC,
+#                                                                   t_start = frame_start,
+#                                                                   t_end = frame_end,
+#                                                                   radioisotope = "C11",
+#                                                                   minweight = 0.3,
+#                                                                   weight_checkn = 5)))) %>%
+#   ungroup() %>%
+#   mutate(tac =map(tac, ~.x %>%
+#                     group_by(Region, Region_spec, ANALYSISID,ROIsize) %>%
+#                     nest(.key="tac_inside")))
+```
+
+```{r}
+# check_weights that they are non-neg, in the ranges that we want them to be in
+tac_dur_weights %>%
+  unnest(tac) %>%
+  unnest(tac_inside) %>%
+  ungroup() %>%
+  summarise(min = min(weights),
+            max= max(weights))
+```
+
+
+
+# Join -> modeldat
+
+```{r}
+modeldat <- tac_dur_weights %>%
+  inner_join(df_input) %>%
+  ungroup() #%>%
+#  mutate(tac = map(tac, ~.x %>%
+#                     ungroup() %>%
+#                     group_by(ANALYSISID) %>%
+#                     nest(.key="tac_inside") %>%
+#                     ungroup()))
+saveRDS(modeldat, "/home/lisatjarks/Repositories/Yale_data/DerivedData/modeldat.rds")
+```
+
+```{r}
+modeldat <- readRDS("../DerivedData/modeldat.rds")
+```
+
+
+## delay fitting
+
+### one tac
+
+```{r}
+test_tac <- modeldat %>%
+  ungroup() %>%
+  slice(1) %>%
+  mutate(tac = map(tac, ~.x %>%
+                     slice(1) %>%
+                     unnest(tac_inside) %>%
+                     ungroup())) %>%
+  select(tac) %>%
+  unnest(tac) %>%
+  ungroup()
+test_input <- modeldat %>%
+  ungroup() %>%
+  slice(1) %>%
+  select(input_df) %>%
+  unnest(input_df) %>%
+  ungroup()
+```
+
+```{r}
+test <- onetcm(
+  t_tac  = as.numeric(test_tac$frame_mid),
+  tac    = as.numeric(test_tac$TAC),
+  input  = test_input,
+  vB     = 0.05,
+  multstart_iter = 10,
+  inpshift.lower = -1,
+  timeStartEnd = c(0,5)
+)
+```
+
+### all tacs
+
+we fit for the Regions 
+
+```{r}
+plan(multicore, workers = 3)
+
+delay_fits <- modeldat %>% 
+  ungroup() %>% 
+  mutate(tac = map(tac, ~.x %>% 
+                     unnest(tac_inside) %>% 
+                     filter(Region=="Frontal" | Region== "Putamen" |Region== "Cerebellum" | Region== "Hippocampus" |Region== "Temporal"| Region== "Amygdala" ) %>% 
+                     ungroup())) %>% 
+  mutate(delayFit = map2(tac, input, ~onetcm(.x$frame_mid, .x$TAC, .y, 
+                                                     vB = 0.05, 
+                                                     multstart_iter = 10,
+                                                     inpshift.lower = -1,
+                                                     #weights=.x$weights,
+                                                     timeStartEnd = c(0,5)))) #%>% 
+  #mutate(inpshift = map_dbl(delayFit, c("par", "inpshift")))
+
+saveRDS(delay_fits, "/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_fits.rds")
+```
+
+
+```{r, warning=FALSE, eval=TRUE}
+plan(multicore, workers = 3)
+
+delay_fits <- modeldat %>%
+  ungroup() %>%
+  mutate(delayFit = map2(tac, input, ~{
+    input <- .y
+    .x %>%
+      filter(Region=="Frontal" | Region== "Putamen" |Region== "Cerebellum" | Region== "Hippocampus" |Region== "Temporal"| Region== "Amygdala" )%>%  
+      #Regions that i want to fit the regions to. maybe i have to unnest then and fit the delay within teh whole/all regions together
+      mutate(fit = map(tac_inside, function(analysisID){
+        #analysisID_clean <- analysisID %>%
+         # filter(!is.na(frame_mid), frame_mid != 0, !is.na(TAC))
+        onetcm(
+          t_tac  = analysisID$frame_mid,
+          tac    = analysisID$TAC,
+          input  = input,
+          vB             = 0.05,
+          multstart_iter = 10,
+          inpshift.lower = -1,
+          timeStartEnd = c(0,5)
+        )
+      })) #%>%
+      #mutate(inpshift = map_dbl(fit, ~.x$par$inpshift))
+  })) #%>%
+  # mutate(inpshift = map(delayFit, ~{
+  #   map_dbl(.x$fit, ~.x$par$inpshift)
+  # }))
+
+saveRDS(delay_fits, "/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_fits.rds")
+```
+
+
+##### checking
+
+
+```{r, fig.width=8, fig.height=8}
+delay_fits <- readRDS("/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_fits.rds") %>% 
+  select(IDPET, delayFit) %>%
+  unnest(delayFit) %>%
+  #mutate(IDPETID = paste(IDPET, ANALYSISID, sep="_")) %>%
+  #select(-ANALYSISID,-IDPET) %>%
+  mutate(inpshift = map_dbl(fit, ~.x$par$inpshift)) 
+
+ggplot(delay_fits, aes(x=inpshift)) +
+  geom_histogram(fill="grey", colour="black") +
+  facet_wrap(~IDPET)
+```
+
+
+##### refit with inpshift_median and get Regions,input
+
+```{r}
+delay_fits_median <- delay_fits %>%
+  group_by(IDPET) %>% 
+  mutate(inpshift_median = median(inpshift)) %>%
+  ungroup() %>%
+  inner_join(input) %>%
+  select(IDPET, SERIESID, Seriesdescription, Region, inpshift, inpshift_median, tac_inside,input)
+```
+
+```{r, warning=FALSE, eval=TRUE}
+# plan(multisession, workers = 8)
+# 
+# fit_delayPlot <- function(tacdata, input, inpshift) {
+#   onetcm(tacdata$frame_mid, tacdata$TAC, input = input, 
+#              inpshift = inpshift,
+#              frameStartEnd = c(1,8))#,
+#              #weights=tacdata$weights)
+# }
+# 
+# 
+# delay_fitplots <- delay_fits_median %>% 
+#   filter(Region=="Frontal") %>% 
+#   ungroup() %>% 
+#   mutate(delayPlotFit = future_pmap(list(tac_inside, input_df, inpshift_median), 
+#                                     fit_delayPlot))
+```
+
+```{r}
+delay_fitplots <- delay_fits_median %>% 
+  filter(Region=="Frontal") %>% 
+  ungroup() %>% 
+  mutate(delayPlotFit = pmap(list(tac_inside, input, inpshift_median), 
+                             function(tacdata, input, inpshift){
+                                 onetcm(tacdata$frame_mid, tacdata$TAC, 
+                                        input    = input, 
+                                        inpshift = inpshift,
+                                        multstart_iter = 10,
+                                        vB=0.05,
+                                        frameStartEnd = c(1,8),
+                                        weights = tacdata$weights)
+                             }))
+
+
+```
+
+
+Now let's see how they look.
+
+```{r}
+map(delay_fitplots$delayPlotFit, plot)
+```
+
+
+Happy with that!  Let's attach that to the modeldat object
+
+```{r}
+modeldata_final <- delay_fits_median %>% 
+  select(IDPET,inpshift_median) %>%
+  distinct() %>%
+  inner_join(modeldat)
+```
+
+## add genotype
+
+```{r}
+genotype <- read_excel("/home/lisatjarks/Repositories/Yale_data/RawData/Genotype_NRR.xlsx") %>%
+  mutate(Genotype = ifelse(Genotype=="C/C", "HAB",ifelse(Genotype=="C/T","MAB",Genotype))) 
+diagnosis <- dat %>% 
+  filter(Type=="TAC") %>% 
+  mutate(tac = map(filename, read_csv, show_col_types = FALSE)) %>%
+  unnest(tac) %>% 
+  select(PATIENTID, DIAGNOSIS, SECONDARY_DIAGNOSIS) %>% 
+  distinct() %>%
+  inner_join(genotype) %>% 
+  mutate(DIAGNOSIS= ifelse(str_detect(SECONDARY_DIAGNOSIS, "Major"),paste(DIAGNOSIS, "2nd_MDD", sep = "_"),DIAGNOSIS)) %>% 
+  select(PATIENTID, DIAGNOSIS, Genotype) %>% 
+  filter(!(PATIENTID=="AS525" & DIAGNOSIS=="Healthy Control")) %>% #this one was doubled, with healthy nonsmoker and control
+  mutate(DIAGNOSIS = ifelse(str_detect(DIAGNOSIS, "lcohol"),"ALC",
+                            ifelse(str_detect(DIAGNOSIS, "epress"), "MDD",
+                                   ifelse(str_detect(DIAGNOSIS, "ealth"),"HC",DIAGNOSIS)))) %>% 
+  arrange(PATIENTID, DIAGNOSIS, Genotype) 
+
+fengconv_vals <- aif_data %>% 
+  select(IDPET,aif_fit) %>% 
+  #unnest(aif_fit) %>% 
+  mutate(A = map_dbl(aif_fit, ~.x$par$A),
+         alpha = map_dbl(aif_fit, ~.x$par$alpha),
+         B = map_dbl(aif_fit, ~.x$par$B),
+         beta = map_dbl(aif_fit, ~.x$par$beta),
+         C = map_dbl(aif_fit, ~.x$par$C),
+         gamma = map_dbl(aif_fit, ~.x$par$gamma),
+         t0 = map_dbl(aif_fit, ~.x$par$t0),
+         ti = map_dbl(aif_fit, ~.x$par$ti)
+         ) %>% 
+  select(-aif_fit)
+
+modeldata_genotype <- modeldata_final %>% 
+  mutate(PATIENTID = str_extract(IDPET, "^[^_]+")) %>%
+  inner_join(diagnosis) %>% 
+  select(-aif,-plasma,-parent,-blood, -PATIENTID) %>%
+  unnest(tac) %>% 
+  ungroup() %>% 
+  select(IDPET, inpshift_median, Genotype, DIAGNOSIS, input, PSTATE, PROTOCOL, Region, Seriesdescription, SERIESID, tac_inside,mean_ROIsize) %>% 
+  inner_join(fengconv_vals)
+
+```
+
+## clean diagnosis
+
+```{r}
+cleaned_modeldat <- modeldata_genotype %>% 
+  mutate(DIAGNOSIS = ifelse(is.na(DIAGNOSIS) & str_detect(PROTOCOL,"alc"), "ALC",
+                            ifelse(is.na(DIAGNOSIS) & str_detect(PROTOCOL, "ptsd"),"PTSD",DIAGNOSIS)))
+table(cleaned_modeldat$DIAGNOSIS)
+```
+
+
+
+
+## save
+
+```{r}
+saveRDS(cleaned_modeldat, "/home/lisatjarks/Repositories/Yale_data/DerivedData/modeldata.rds")
+```
+
+###plots to check
+Let's plot one to be sure
+
+```{r}
+
+for(i in 1:10) {
+  
+  a <- ggplot(tac_dur_final$tac[[i]]$tac_inside[[i]], aes(x=frame_mid_mod, y=TAC)) +
+  geom_point() +
+  geom_line()
+  
+  plot(a)
+  
+}
+
+
+```
+
+<!-- #### checking the different regions (gm, pvc,...) -->
+
+
+<!-- ```{r} -->
+<!-- data_tacdemog <- tac_new %>% -->
+<!--   inner_join(demog) %>% -->
+<!--   unnest(tac)%>% -->
+<!--   unnest(tac) %>% -->
+<!--   mutate(Region_spec =Region, -->
+<!--          Region = str_extract(Region_spec, "^[^_]+"), -->
+<!--          Region = paste0(toupper(substr(Region, 1, 1)), substr(Region, 2, nchar(Region))), -->
+<!--          region_identifiable = paste0(Region_spec, ANALYSISID)) %>% -->
+<!--   group_by(IDPET) %>% -->
+<!--   nest(.key="data") -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- plot_data <- data_tacdemog %>% -->
+<!--   filter(ID == "JL926") %>% -->
+<!--   unnest(data) -->
+
+
+<!-- for (i in unique(plot_data$Region)){ -->
+<!--    plot <- plot_data %>% filter(Region==i) %>% -->
+<!--   ggplot(aes(x = frame_mid, y = TAC, colour = region_identifiable)) + -->
+<!--   geom_point() + -->
+<!--   geom_line() + -->
+<!--     labs(title = i) -->
+
+<!--    print(plot) -->
+<!-- } -->
+
+<!-- ``` -->
+
+
+
+<!-- ```{r} -->
+<!-- plot_data <- data_tacdemog %>% -->
+<!--   filter(ID == "AS525", PET=="12519") %>% -->
+<!--   unnest(data) -->
+
+
+<!-- for (i in unique(plot_data$Region)){ -->
+<!--    plot <- plot_data %>% filter(Region==i) %>% -->
+<!--   ggplot(aes(x = frame_mid, y = TAC, colour = region_identifiable)) + # -->
+<!--   geom_point() + -->
+<!--   geom_line() + -->
+<!--     labs(title = i) -->
+
+<!--    print(plot) -->
+<!-- } -->
+
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- plot_data <- data_tacdemog %>% -->
+<!--   filter(ID=="DF153", PET=="21094") %>% -->
+<!--   unnest(data) -->
+
+
+<!-- for (i in unique(plot_data$Region)){ -->
+<!--    plot <- plot_data %>% filter(Region==i) %>% -->
+<!--   ggplot(aes(x = frame_mid, y = TAC, colour = region_identifiable)) + #/InjRad_SUV -->
+<!--   geom_point() + -->
+<!--   geom_line() + -->
+<!--     labs(title = i) -->
+
+<!--    print(plot) -->
+<!-- } -->
+
+<!-- ``` -->
+
+
+
+# TAC Fitting
+
+```{r}
+modeldat_forfitting <- readRDS("../DerivedData/modeldata.rds")
+```
+
+## Two-Tissue Compartment Model
+
+Now let's fit all the TACs using the 2TC and the fitted delay values.
+
+# get here the second map to catch the tac_inside instead of the tac
+```{r, eval=TRUE}
+fit_2tc <- function(tacdata, input, inpshift) {
+  twotcm(tacdata$frame_mid, tacdata$TAC, input = input, 
+             inpshift = inpshift,
+             multstart_iter = 10,
+             weights=tacdata$weights)
+}
+
+plan(multicore, workers = 8)
+
+#if Time AIF>120, approx is NA
+
+fits_2tc <- modeldat_forfitting %>% 
+  ungroup() %>% 
+  mutate(fit = future_pmap(list(tac_inside, input, inpshift_median), fit_2tc))
+
+saveRDS(fits_2tc, "../DerivedData/2tc_fits.rds")
+```
+
+
+```{r}
+pars_2tc <- readRDS("../DerivedData/2tc_fits.rds") %>% 
+  pull(fit) %>% 
+  map("par") %>% 
+  bind_rows()
+
+pars_2tc
+```
+
+Let's also take a look at the distributions
+
+```{r}
+pars_2tc %>% 
+  gather("Parameter", "Value", -inpshift, -vB) %>% 
+  ggplot(aes(x=Value, fill=Parameter)) +
+  geom_histogram(colour="black") +
+  facet_wrap(~Parameter, scales="free")
+
+pars_2tc %>% 
+  gather("Parameter", "Value", -inpshift, -vB) %>% 
+  ggplot(aes(x=Value, fill=Parameter)) +
+  geom_histogram(colour="black") +
+  facet_wrap(~Parameter, scales="free") +
+  scale_x_log10()
+```
+
+
+# Prepare for SiMBA
+
+## Align AIF/TAC
+
+```{r}
+aifpars <- modeldat_forfitting %>% 
+  mutate(t0_inpshift = t0 + inpshift_median)
+
+aifpars_unnested <- aifpars %>% unnest(tac_inside)
+
+ggplot(aifpars, aes(x=t0_inpshift)) +
+  geom_histogram(colour="black", fill="grey") +
+  geom_vline(xintercept=0, linetype="dashed")
+```
+
+
+## meanblood
+
+```{r}
+meanblood <- aifpars %>% 
+  mutate(input = map2(input, inpshift_median, ~mutate(.x, Time = Time + .y)))
+```
+
+```{r}
+add_meanblood <- function(input, tacs) {
+  meanblood_vec <- map2_dbl(tacs$frame_start, tacs$frame_end, 
+                             ~input %>% 
+                               filter(Time >= .x) %>% 
+                               filter(Time < .y) %>% 
+                               pull(Blood) %>% 
+                               mean())
+  
+  tacs %>% 
+    mutate(meanblood = meanblood_vec)
+}
+
+meanblood <- meanblood %>% 
+  mutate(tac_inside = map2(input, tac_inside, add_meanblood)) %>% 
+  select(IDPET, tac_inside) %>% 
+  unnest(tac_inside) %>% 
+  filter(!duplicated(paste(IDPET, frame_start, frame_end))) %>% 
+  select(IDPET, frame_mid, meanblood)
+
+meanblood
+```
+
+Let's take a look at one of the curves
+
+```{r}
+meanblood %>% 
+  filter(IDPET == IDPET[1]) %>% 
+  #mutate(t_tac = frame_start + 0.5*(frame_end-frame_start)) %>% 
+  ggplot(aes(x=frame_mid, y=meanblood)) +
+  geom_line(colour="red") +
+  geom_point()
+```
+
+
+Now let's add these back to the model data
+
+```{r}
+simba_modeldat <- aifpars %>% 
+  unnest(tac_inside) %>% 
+  inner_join(meanblood) %>% 
+  select(-inpshift_median, -t0_inpshift)
+```
+
+
+## Region Sizes
+
+The region sizes influence the measurement error, so we should add these to the model.  We calculated them earlier, but let's also log them and centre the logged values for the model.
+
+```{r}
+simba_modeldat <- simba_modeldat %>% 
+  ungroup() %>% 
+  mutate(logRegSize = log(mean_ROIsize),
+         logRegSize_c = logRegSize - mean(logRegSize))
+```
+
+
+## Injected Radioactivity
+
+The injected radioactivity is also a predictor of the measurement error.  Let's add this too.
+
+```{r}
+injection_info <- demog %>% 
+  unnest(demog) %>% 
+  ungroup() %>% 
+  mutate(IDPET = paste(ID,PET,sep = "_")) %>% 
+  select(-ID, -PET) %>% 
+  mutate(logInjRad = log(InjRad),
+         logInjRad_c = logInjRad - mean(logInjRad)) %>% 
+  mutate(Age_dec = Age / 10,
+         Age_dec_c = Age_dec - mean(Age_dec))
+
+simba_modeldat <- simba_modeldat %>% 
+  left_join(injection_info)
+```
+
+## Durations
+
+Lastly, I know we already have the durations, but we want to include the centred log durations in our model, so let's add that here too
+
+```{r}
+simba_modeldat <- simba_modeldat %>% 
+  mutate(logdur = log(dur),
+         logdur_c = logdur - mean(logdur))
+```
+
+## clean LPS session
+
+```{r}
+LPS_cleaned <- simba_modeldat %>% 
+  mutate(PATIENTID = str_extract(IDPET, "^[^_]+")) %>%
+  select(PATIENTID, IDPET,PSTATE, SERIESID,Seriesdescription) %>% 
+  distinct() %>% 
+  group_by(PATIENTID) %>% 
+  mutate(count=n()) %>%
+  ungroup() %>% 
+  arrange(PATIENTID, SERIESID, IDPET, PSTATE) %>% 
+  mutate(LPS = ifelse(count>=2 & (str_detect(PSTATE, "pre") | str_detect(PSTATE,"base") | str_detect(PSTATE,"One")),"baseline",
+                      ifelse(count>=2 & (str_detect(PSTATE, "ost")  | str_detect(PSTATE,"Two")),"post",
+                             ifelse(count %% 2 & count>=2 & is.na(PSTATE), "post", NA)))) %>% 
+  mutate(LPSpair = ifelse(is.na(LPS),FALSE,TRUE)) %>% 
+  mutate(LPS = ifelse(is.na(LPS),"baseline", LPS)) %>% 
+  select(IDPET,LPS,LPSpair)
+
+
+
+  # filter(!is.na(LPS)) %>% 
+  # group_by(PATIENTID) %>%
+  # arrange(SERIESID, .by_group = TRUE) %>%
+  # mutate(
+  #   pair_id = (row_number() - 1) %/% 2 + 1,
+  #   LPS = ifelse(count > 2, paste0(LPS, "_", pair_id), LPS)
+  # ) %>%
+  # select(-pair_id, -count) %>% 
+  # ungroup() %>% 
+  # select(IDPET, LPS)
+
+simba_modeldat_new <- simba_modeldat %>% 
+  left_join(LPS_cleaned) %>% 
+  select(-PSTATE)
+
+```
+
+
+
+```{r}
+saveRDS(simba_modeldat_new, "../DerivedData/Yale_simba_modeldata.rds")
+```
+
+
+```{r}
+nested <- simba_modeldata %>% 
+  group_by(genotype,DIAGNOSIS, PROTOCOL, Seriesdescription,SERIESID,Age, Sex,LPS,LPSpair,sub) %>%
+  nest() %>% 
+  ungroup()
+
+nested %>% 
+  group_by(PROTOCOL) %>%
+  summarise(meanAGE= mean(Age),
+            count = n(),
+            n_HABs = sum(genotype == "HAB", na.rm = TRUE),
+            n_male = sum(Sex=="M", na.rm = TRUE))
+nest <- nested %>% 
+  group_by(PROTOCOL, DIAGNOSIS) %>% 
+  nest()
+```
+
+
+
+I decide to bind all of them together to make sure i do not analyse scans i do not have everything given.
+
+# AIF analysis for each Protocol
+## plot calc/fitted AIFs together
+
+we want to calculate for each protocol at least one curve where we hopefully see the same to validate, using their data for the first 10 min, and then the own calculation
+
+```{r}
+table(alldata$PROTOCOL)
+```
+
+
+
+```{r}
+set.seed(1234)
+
+
+plot_data <- alldata %>% 
+    mutate(aif_calc =map(aif_calc, ~.x %>%
+                    rename(AIF = AIF_calc) %>%
+                    select(Time,AIF))) %>%
+    mutate(aif =map(aif, ~.x %>%
+                    select(Time,AIF))) %>%
+    mutate(aif_combined =map(aif_combined, ~.x %>%
+                    select(Time,AIF))) 
+
+for (i in unique(alldata$PROTOCOL)){
+  plotdat <- plot_data %>% 
+    filter(PROTOCOL==i)
+  
+  draw <- sample(length(plotdat$ID),1)
+  #print(i)
+  #print(draw)
+  id <- plotdat$ID[[draw]]
+  pet <- plotdat$PET[[draw]]
+  # print(id)
+  # print(pet)
+  plot <- bind_rows(
+      plotdat %>%
+        filter(ID==id,PET==pet) %>%
+        unnest(aif_calc) %>% mutate(source="calculated (PARENT*PLASMA)"),
+      plotdat %>%
+        filter(ID==id,PET==pet) %>%
+        unnest(aif) %>% mutate(source="given"),
+      plotdat %>%
+        filter(ID==id,PET==pet) %>%
+        unnest(aif_combined) %>% mutate(source="combined (calc after 3 min)")
+    ) %>%
+    ggplot(aes(x = Time, y = AIF, colour = source)) +
+    geom_point() +
+    geom_line() +
+    coord_cartesian(xlim=c(0, 15)) +
+    labs(title = paste0("AIFs for ID=", id, ", PET=", pet, ", Protocol=", i))
+  
+  plot(plot)
+}
+```
+
+looking at these fits, we decided to use their AIF data for the first 10 minutes, and then we calculate the AIF=PLASMA*PARENT
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ROI Sizes
+
+```{r}
+sum(is.na(tac$ROIsize))
+sum(!is.na(tac$ROIsize))
+testdata <- tac_new %>%
+  filter(is.na(ROIsize))
+table(testdata$Region)
+```
+
+
+
+
+
+
+
+```{r}
+roisizes <- tac_dur_weights %>% 
+  unnest(tac) %>%
+  ungroup() %>%
+  select(ID, PET, ANALYSISID, ROIsize, Region) %>% 
+  arrange(ID)
+
+naniar::vis_miss(roisizes)
+```
+This looks like the missing sizes are all within one individual.
+
+```{r}
+roisizes %>% 
+  group_by(ID, PET) %>% 
+  summarise(all_there = all(!is.na(ROIsize)))
+```
+
+Ok, so let's just use average ROI sizes.
+
+```{r}
+roisizes <- roisizes %>% 
+  group_by(ID) %>% 
+  mutate(missing = is.na(mean(ROIsize))) %>% 
+  filter(!missing) %>% 
+  select(-missing)
+
+naniar::vis_miss(roisizes)
+
+table(roisizes$ID, roisizes$Region)
+```
+
+Nice!
+
+Now let's calculate regional means
+
+```{r}
+mean_roisizes <- roisizes %>% 
+  group_by(Region) %>% 
+  summarise(RegSize = mean(ROIsize)) %>% 
+  mutate(logRegSize = log(RegSize),
+         logRegSize_c = logRegSize - mean(logRegSize))
+
+saveRDS(mean_roisizes, "../../DerivedData/Data2_mean_roisizes.rds")
+```
+
+
+
+
+
+<!-- # Just trying to understand the data -->
+
+<!-- ## Bolus: Baseline + post-dose -->
+
+<!-- ```{r} -->
+<!-- demog %>%  -->
+<!--   filter(ID=="RG189") -->
+
+<!-- bol_b_p <- modeldat_nested %>%  -->
+<!--   filter(ID == "RG189") -->
+
+
+<!-- bol_b_p %>%  -->
+<!--   select(ID, PET, State, tacs) %>%  -->
+<!--   unnest(tacs) %>%  -->
+<!--   select(ID, PET, State, t_tac, Frontal) %>%  -->
+<!--   ggplot(aes(x=t_tac, y=Frontal, colour=State)) +  -->
+<!--   geom_point() + -->
+<!--   geom_line() -->
+<!-- ``` -->
+
+
+
+<!-- ## Bolus+infusion: Baseline + post-dose -->
+
+<!-- ```{r} -->
+<!-- demog %>%  -->
+<!--   filter(ID=="SC392") -->
+
+<!-- bolinf_b_p <- modeldat_nested %>%  -->
+<!--   filter(ID == "SC392") -->
+
+
+<!-- bolinf_b_p %>%  -->
+<!--   select(ID, PET, State, tacs) %>%  -->
+<!--   unnest(tacs) %>%  -->
+<!--   select(ID, PET, State, t_tac, Frontal) %>%  -->
+<!--   ggplot(aes(x=t_tac, y=Frontal, colour=State)) +  -->
+<!--   geom_point() + -->
+<!--   geom_line() -->
+<!-- ``` -->
+
+
+<!-- ## Bolus+infusion: Displacement + post-dose -->
+
+<!-- ```{r} -->
+<!-- demog %>%  -->
+<!--   filter(ID=="SA746") -->
+
+<!-- bolinf_d_p <- modeldat_nested %>%  -->
+<!--   filter(ID == "SA746") -->
+
+
+<!-- bolinf_d_p %>%  -->
+<!--   select(ID, PET, State, tacs) %>%  -->
+<!--   unnest(tacs) %>%  -->
+<!--   select(ID, PET, State, t_tac, Frontal) %>%  -->
+<!--   ggplot(aes(x=t_tac, y=Frontal, colour=State, group=PET)) +  -->
+<!--   geom_point() + -->
+<!--   geom_line() -->
+<!-- ``` -->
