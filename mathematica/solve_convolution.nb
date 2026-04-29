@@ -1,0 +1,263 @@
+(* Content-type: application/vnd.wolfram.mathematica *)
+
+(*** Wolfram Notebook File ***)
+(* http://www.wolfram.com/nb *)
+
+(* CreatedBy='Wolfram 14.3' *)
+
+(*CacheID: 234*)
+(* Internal cache information:
+NotebookFileLineBreakTest
+NotebookFileLineBreakTest
+NotebookDataPosition[       154,          7]
+NotebookDataLength[      9562,        255]
+NotebookOptionsPosition[      8425,        226]
+NotebookOutlinePosition[      8815,        242]
+CellTagsIndexPosition[      8772,        239]
+WindowFrame->Normal*)
+
+(* Beginning of Notebook Content *)
+Notebook[{
+
+Cell[CellGroupData[{
+Cell["Solving the convolution", "Title",
+ CellChangeTimes->{{3.979115242372308*^9, 3.979115256232266*^9}, {
+  3.979115320633569*^9, 
+  3.979115332372528*^9}},ExpressionUUID->"bf387696-81e4-4482-8669-\
+acf1af864341"],
+
+Cell[BoxData[
+ RowBox[{
+  RowBox[{"testparams", "=", 
+   RowBox[{"{", 
+    RowBox[{
+     RowBox[{"t0", "\[Rule]", "0.7"}], ",", " ", 
+     RowBox[{"A", "\[Rule]", "3123"}], ",", 
+     RowBox[{"B", "\[Rule]", "27"}], ",", 
+     RowBox[{"C", "\[Rule]", "6.8"}], ",", 
+     RowBox[{"alpha", "\[Rule]", "8.5"}], ",", 
+     RowBox[{"beta", "\[Rule]", "0.51"}], ",", 
+     RowBox[{"gamma", "\[Rule]", "0.04"}], ",", " ", 
+     RowBox[{"inftime", "\[Rule]", "0.33"}], ",", " ", 
+     RowBox[{"Ph1", "\[Rule]", "0.054"}], ",", " ", 
+     RowBox[{"Th1", "\[Rule]", "0.14"}], ",", 
+     RowBox[{"Ph2", "\[Rule]", "0.046"}], ",", 
+     RowBox[{"Th2", "\[Rule]", "0.012"}], ",", 
+     RowBox[{"Ph3", "\[Rule]", "0.011"}], ",", 
+     RowBox[{"Th3", "\[Rule]", "0.004"}], ",", 
+     RowBox[{"Ph4", "\[Rule]", "0.005"}], ",", 
+     RowBox[{"Th4", "\[Rule]", "0.002"}]}], "}"}]}], ";"}]], "Input",
+ CellChangeTimes->{3.979117184820376*^9},
+ CellLabel->"In[26]:=",ExpressionUUID->"0fdb5495-c35f-4bd1-a118-1505a003768e"],
+
+Cell[CellGroupData[{
+
+Cell["Feng Model:", "Subtitle",
+ CellChangeTimes->{{3.97911535823518*^9, 
+  3.9791153912585506`*^9}},ExpressionUUID->"e9f8d254-b6bc-44e3-8015-\
+a626c0542ead"],
+
+Cell[BoxData[
+ RowBox[{
+  RowBox[{
+   RowBox[{"Feng", "[", 
+    RowBox[{
+    "t_", ",", "A_", ",", " ", "B_", ",", " ", "C_", ",", " ", "alpha_", ",", 
+     " ", "beta_", ",", " ", "gamma_"}], "]"}], "=", " ", 
+   RowBox[{
+    RowBox[{
+     RowBox[{"(", 
+      RowBox[{
+       RowBox[{"A", "*", "t"}], " ", "-", " ", "B", " ", "-", " ", "C"}], 
+      ")"}], "*", 
+     RowBox[{"Exp", "[", 
+      RowBox[{
+       RowBox[{"-", "alpha"}], "*", "t"}], "]"}]}], " ", "+", " ", 
+    RowBox[{"B", "*", 
+     RowBox[{"Exp", "[", 
+      RowBox[{
+       RowBox[{"-", "beta"}], "*", "t"}], "]"}]}], " ", "+", " ", 
+    RowBox[{"C", "*", 
+     RowBox[{"Exp", "[", 
+      RowBox[{
+       RowBox[{"-", "gamma"}], "*", "t"}], "]"}]}]}]}], ";"}]], "Input",
+ CellLabel->"In[27]:=",ExpressionUUID->"1e6aa984-326d-4bc9-878a-51c71c9e5bfd"]
+}, Open  ]],
+
+Cell[CellGroupData[{
+
+Cell["\<\
+2TCM with one additional irreversible compartment (within-tissue).\
+\>", "Subtitle",
+ CellChangeTimes->{{3.979115441823217*^9, 
+  3.979115490555711*^9}},ExpressionUUID->"4a64ee6e-d63a-498e-82d5-\
+98a95e4d6089"],
+
+Cell[BoxData[{
+ StyleBox[
+  RowBox[{
+   RowBox[{
+    RowBox[{"HTPrev", "[", 
+     RowBox[{
+     "t_", ",", "tau_", ",", "Ph1_", ",", " ", "Th1_", ",", "Ph2_", ",", " ", 
+      "Th2_"}], "]"}], ":=", 
+    RowBox[{
+     RowBox[{"Ph1", " ", 
+      RowBox[{"Exp", "[", 
+       RowBox[{
+        RowBox[{"-", "Th1"}], " ", 
+        RowBox[{"(", 
+         RowBox[{"t", "-", "tau"}], ")"}]}], "]"}]}], "+", 
+     RowBox[{"Ph2", " ", 
+      RowBox[{"Exp", "[", 
+       RowBox[{
+        RowBox[{"-", "Th2"}], " ", 
+        RowBox[{"(", 
+         RowBox[{"t", "-", "tau"}], ")"}]}], "]"}]}]}]}], ";"}], "Input"], "\[IndentingNewLine]", 
+ RowBox[{
+  RowBox[{
+   StyleBox[
+    RowBox[{"M", "[", "t_", "]"}], "Input"], ":=", 
+   RowBox[{"Assuming", "[", 
+    RowBox[{
+     RowBox[{
+      RowBox[{"t", ">", "0"}], "&&", 
+      RowBox[{"alpha", ">", "0"}], "&&", 
+      RowBox[{"beta", ">", "0"}], "&&", 
+      RowBox[{"gamma", ">", "0"}], "&&", 
+      RowBox[{"Th1", ">", "0"}], "&&", 
+      RowBox[{"Th2", ">", "0"}]}], ",", 
+     RowBox[{
+      RowBox[{"Integrate", "[", 
+       RowBox[{
+        RowBox[{
+         RowBox[{"Feng", "[", 
+          RowBox[{
+          "tau", ",", "A", ",", "B", ",", "C", ",", "alpha", ",", "beta", ",",
+            "gamma"}], "]"}], "*", 
+         RowBox[{"HTPrev", "[", 
+          RowBox[{
+          "t", ",", "tau", ",", " ", "Ph1", ",", "Th1", ",", "Ph2", ",", 
+           "Th2"}], "]"}]}], ",", 
+        RowBox[{"{", 
+         RowBox[{"tau", ",", "0", ",", "t"}], "}"}]}], "]"}], "+", 
+      RowBox[{"Ph3", "*", 
+       RowBox[{"Integrate", "[", 
+        RowBox[{
+         RowBox[{"Feng", "[", 
+          RowBox[{
+          "tau", ",", "A", ",", "B", ",", "C", ",", "alpha", ",", "beta", ",",
+            "gamma"}], "]"}], ",", 
+         RowBox[{"{", 
+          RowBox[{"tau", ",", "0", ",", "t"}], "}"}]}], "]"}]}]}]}], "]"}]}], 
+  ";"}], "\[IndentingNewLine]", 
+ RowBox[{
+  RowBox[{"g", "[", "t_", "]"}], ":=", 
+  RowBox[{"Integrate", "[", 
+   RowBox[{
+    RowBox[{"M", "[", "s", "]"}], ",", 
+    RowBox[{"{", 
+     RowBox[{"s", ",", "0", ",", "t"}], "}"}], ",", 
+    RowBox[{"Assumptions", "->", 
+     RowBox[{"t", ">", "0"}]}]}], "]"}]}]}], "Input",
+ CellChangeTimes->{{3.979115368983047*^9, 3.979115369576577*^9}, {
+  3.979115546755245*^9, 3.979115546889097*^9}, {3.979115584569071*^9, 
+  3.979115776725037*^9}, {3.9791158154438963`*^9, 3.9791158588642187`*^9}, {
+  3.9791161437757263`*^9, 3.979116150228606*^9}, {3.979116279290649*^9, 
+  3.979116630106081*^9}, {3.979116730007847*^9, 3.9791167315761013`*^9}, {
+  3.979116831652313*^9, 3.979116878941411*^9}, {3.979118592623004*^9, 
+  3.979118597305709*^9}, {3.979118809397826*^9, 3.979118818866208*^9}},
+ CellLabel->"In[80]:=",ExpressionUUID->"65b62eaf-eb73-4c83-aac2-5e0442e2666e"],
+
+Cell[CellGroupData[{
+
+Cell[BoxData[
+ RowBox[{"CForm", "[", 
+  RowBox[{"g", "[", "t", "]"}], "]"}]], "Input",
+ CellChangeTimes->{3.979116739995357*^9, 3.979117045150373*^9},
+ CellLabel->"In[83]:=",ExpressionUUID->"929a13d3-f443-42c3-84b8-a017900375eb"],
+
+Cell["\<\
+(B*(1 - Power(E,-(alpha*t)))*Ph3)/Power(alpha,2) + 
+   (C*(1 - Power(E,-(alpha*t)))*Ph3)/Power(alpha,2) + 
+   (A*(-1 + Power(E,-(alpha*t)))*Ph3)/Power(alpha,3) + 
+   (B*(-1 + Power(E,-(beta*t)))*Ph3)/Power(beta,2) + 
+   (C*(-1 + Power(E,-(gamma*t)))*Ph3)/Power(gamma,2) + 
+   (A*Ph3*t)/Power(alpha,2) - (B*Ph3*t)/alpha + (B*Ph3*t)/beta - 
+   (C*Ph3*t)/alpha + (C*Ph3*t)/gamma - 
+   (A*Ph3*(1 - (1 + alpha*t)/Power(E,alpha*t)))/Power(alpha,3) - 
+   (A*(1 - Power(E,-(alpha*t)))*Ph1)/(alpha*Power(alpha - Th1,2)) - 
+   (A*Ph1*(1 - (1 + alpha*t)/Power(E,alpha*t)))/
+    (alpha*Power(alpha - Th1,2)) + 
+   (B*(1 - Power(E,-(alpha*t)))*Ph1)/(alpha*(alpha - Th1)) + 
+   (C*(1 - Power(E,-(alpha*t)))*Ph1)/(alpha*(alpha - Th1)) + 
+   (A*(1 - Power(E,-(t*Th1)))*Ph1)/(Power(alpha - Th1,2)*Th1) - 
+   (B*(1 - Power(E,-(t*Th1)))*Ph1)/((alpha - Th1)*Th1) - 
+   (C*(1 - Power(E,-(t*Th1)))*Ph1)/((alpha - Th1)*Th1) + 
+   (B*(1 - Power(E,-(t*Th1)))*Ph1)/((beta - Th1)*Th1) + 
+   (C*(1 - Power(E,-(t*Th1)))*Ph1)/((gamma - Th1)*Th1) + 
+   (A*Ph1*(1 - (1 + alpha*t)/Power(E,alpha*t))*Th1)/
+    (Power(alpha,2)*Power(alpha - Th1,2)) + 
+   (B*(1 - Power(E,-(beta*t)))*Ph1)/(beta*(-beta + Th1)) + 
+   (C*(1 - Power(E,-(gamma*t)))*Ph1)/(gamma*(-gamma + Th1)) - 
+   (A*(1 - Power(E,-(alpha*t)))*Ph2)/(alpha*Power(alpha - Th2,2)) - 
+   (A*Ph2*(1 - (1 + alpha*t)/Power(E,alpha*t)))/
+    (alpha*Power(alpha - Th2,2)) + 
+   (B*(1 - Power(E,-(alpha*t)))*Ph2)/(alpha*(alpha - Th2)) + 
+   (C*(1 - Power(E,-(alpha*t)))*Ph2)/(alpha*(alpha - Th2)) + 
+   (A*(1 - Power(E,-(t*Th2)))*Ph2)/(Power(alpha - Th2,2)*Th2) - 
+   (B*(1 - Power(E,-(t*Th2)))*Ph2)/((alpha - Th2)*Th2) - 
+   (C*(1 - Power(E,-(t*Th2)))*Ph2)/((alpha - Th2)*Th2) + 
+   (B*(1 - Power(E,-(t*Th2)))*Ph2)/((beta - Th2)*Th2) + 
+   (C*(1 - Power(E,-(t*Th2)))*Ph2)/((gamma - Th2)*Th2) + 
+   (A*Ph2*(1 - (1 + alpha*t)/Power(E,alpha*t))*Th2)/
+    (Power(alpha,2)*Power(alpha - Th2,2)) + 
+   (B*(1 - Power(E,-(beta*t)))*Ph2)/(beta*(-beta + Th2)) + 
+   (C*(1 - Power(E,-(gamma*t)))*Ph2)/(gamma*(-gamma + Th2))\
+\>", "Output",
+ CellChangeTimes->{3.97911707424506*^9, 3.979117240660701*^9, 
+  3.9791176451957703`*^9, 3.979118671607271*^9, 3.979118724712926*^9, 
+  3.9791188510828648`*^9},
+ CellLabel->
+  "Out[83]//CForm=",ExpressionUUID->"ccac644d-75b2-45d9-9bec-4a36fc4dfc84"]
+}, Open  ]]
+}, Open  ]]
+}, Open  ]]
+},
+WindowSize->{735, 809},
+WindowMargins->{{0, Automatic}, {Automatic, 0}},
+FrontEndVersion->"14.3 for Mac OS X ARM (64-bit) (July 8, 2025)",
+StyleDefinitions->"Default.nb",
+ExpressionUUID->"d723b365-af28-4a44-a9b3-d4b9b925bd29"
+]
+(* End of Notebook Content *)
+
+(* Internal cache information *)
+(*CellTagsOutline
+CellTagsIndex->{}
+*)
+(*CellTagsIndex
+CellTagsIndex->{}
+*)
+(*NotebookFileOutline
+Notebook[{
+Cell[CellGroupData[{
+Cell[576, 22, 215, 4, 96, "Title",ExpressionUUID->"bf387696-81e4-4482-8669-acf1af864341"],
+Cell[794, 28, 1002, 22, 70, "Input",ExpressionUUID->"0fdb5495-c35f-4bd1-a118-1505a003768e"],
+Cell[CellGroupData[{
+Cell[1821, 54, 158, 3, 52, "Subtitle",ExpressionUUID->"e9f8d254-b6bc-44e3-8015-a626c0542ead"],
+Cell[1982, 59, 819, 24, 49, "Input",ExpressionUUID->"1e6aa984-326d-4bc9-878a-51c71c9e5bfd"]
+}, Open  ]],
+Cell[CellGroupData[{
+Cell[2838, 88, 220, 5, 83, "Subtitle",ExpressionUUID->"4a64ee6e-d63a-498e-82d5-98a95e4d6089"],
+Cell[3061, 95, 2760, 74, 151, "Input",ExpressionUUID->"65b62eaf-eb73-4c83-aac2-5e0442e2666e"],
+Cell[CellGroupData[{
+Cell[5846, 173, 229, 4, 29, "Input",ExpressionUUID->"929a13d3-f443-42c3-84b8-a017900375eb"],
+Cell[6078, 179, 2307, 42, 653, "Output",ExpressionUUID->"ccac644d-75b2-45d9-9bec-4a36fc4dfc84"]
+}, Open  ]]
+}, Open  ]]
+}, Open  ]]
+}
+]
+*)
+
