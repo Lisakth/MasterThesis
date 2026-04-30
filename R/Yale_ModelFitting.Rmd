@@ -1,0 +1,3641 @@
+---
+title: "SiMBA Modelling"
+output: html_notebook
+---
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(kinfitr)
+library(bloodstream)
+library(brms)
+library(rstan)
+library(furrr)
+library(ggcorrplot2)
+#library(relfeas)
+library(cmdstanr)
+library(loo)
+```
+
+# Data
+
+For the Yale data
+```{r}
+simba_modeldata <- readRDS("../DerivedData/Yale_simba_modeldata.rds") %>% 
+  rename(pet = IDPET,
+         genotype = Genotype,
+         region = Region) %>% 
+  select(-input) %>% 
+  mutate(sub= str_extract(pet, "^[^_]+")) %>% 
+  ungroup() %>% 
+  #mutate(genotype = ifelse(is.na(genotype), "NA",genotype)) %>% 
+  filter(!is.na(genotype)) %>% 
+  mutate(region = factor(region) %>% 
+           forcats::fct_relevel("Frontal"))
+```
+
+```{r}
+simba_modeldata_sub <- simba_modeldata %>% 
+  filter(pet=="AS525_12519" | pet == "AS525_12520" | #HAB, HC
+           pet == "GN773_12604"| pet == "GN773_12605"| #MAB, HC
+           pet == "LP272_13429"| pet == "LP272_13480"| #MAB, ALC
+           pet == "MS932_20451"| pet == "MS932_20450"| #HAB, PTSD
+           #pet == "CC897_6755"| #NA, MDD
+           pet == "TD049_8689"| #MAB, MDD
+           pet == "JS653_9176"| #MAB, HC
+           pet == "MJ893_8084" #HAB, HC
+           ) %>% 
+  ungroup()
+```
+
+```{r}
+simba_modeldata_LPS <- simba_modeldata %>%
+  filter(LPSpair) 
+```
+
+
+
+# STAN Models
+
+
+## 3TC5K
+* threetc5kND_log_stan : 
+* threetc5kND_log_stan_BPp : 
+* threetc5kND_log_stan_mix : Mixture model variant
+* threetc5kND_log_stan_mix_BPp
+* threetc5kND_log_stan_mix_BPp_k2 : with Vnddiff
+
+for S and P the same
+all included into one Stan block that i do not get issues with pointers in the wrong direction
+
+```{r, fig.height=10, fig.width=6}
+three_compartment_5k_fengconv_stan <- "
+
+real Integral_Feng_3TC5K(real time, real A, real B, real C, 
+                       real alpha, real beta, real gamma, 
+                       real Th1, real Th2, real Ph1, real Ph2, real Ph3) {
+     
+    real integ;
+    
+    integ = (B*(1 - exp(-(alpha*time)))*Ph3)/alpha^2 + (C*(1 - exp(-(alpha*time)))*Ph3)/alpha^2 + (A*(-1 + exp(-(alpha*time)))*Ph3)/alpha^3 + 
+  (B*(-1 + exp(-(beta*time)))*Ph3)/beta^2 + (C*(-1 + exp(-(gamma*time)))*Ph3)/gamma^2 + (A*Ph3*time)/alpha^2 - (B*Ph3*time)/alpha + (B*Ph3*time)/beta - 
+  (C*Ph3*time)/alpha + (C*Ph3*time)/gamma - (A*Ph3*(1 - (1 + alpha*time)/exp(alpha*time)))/alpha^3 - (A*(1 - exp(-(alpha*time)))*Ph1)/(alpha*(alpha-Th1)^2) - 
+  (A*Ph1*(1 - (1 + alpha*time)/exp(alpha*time)))/(alpha*(alpha-Th1)^2) + (B*(1 - exp(-(alpha*time)))*Ph1)/(alpha*(alpha - Th1)) + 
+  (C*(1 - exp(-(alpha*time)))*Ph1)/(alpha*(alpha - Th1)) + (A*(1 - exp(-(time*Th1)))*Ph1)/((alpha-Th1)^2*Th1) - 
+  (B*(1 - exp(-(time*Th1)))*Ph1)/((alpha - Th1)*Th1) - (C*(1 - exp(-(time*Th1)))*Ph1)/((alpha - Th1)*Th1) + (B*(1 - exp(-(time*Th1)))*Ph1)/((beta - Th1)*Th1) + 
+  (C*(1 - exp(-(time*Th1)))*Ph1)/((gamma - Th1)*Th1) + (A*Ph1*(1 - (1 + alpha*time)/exp(alpha*time))*Th1)/(alpha^2*(alpha-Th1)^2) + 
+  (B*(1 - exp(-(beta*time)))*Ph1)/(beta*(-beta + Th1)) + (C*(1 - exp(-(gamma*time)))*Ph1)/(gamma*(-gamma + Th1)) - 
+  (A*(1 - exp(-(alpha*time)))*Ph2)/(alpha*(alpha-Th2)^2) - (A*Ph2*(1 - (1 + alpha*time)/exp(alpha*time)))/(alpha*(alpha-Th2)^2) + 
+  (B*(1 - exp(-(alpha*time)))*Ph2)/(alpha*(alpha - Th2)) + (C*(1 - exp(-(alpha*time)))*Ph2)/(alpha*(alpha - Th2)) + 
+  (A*(1 - exp(-(time*Th2)))*Ph2)/((alpha-Th2)^2*Th2) - (B*(1 - exp(-(time*Th2)))*Ph2)/((alpha - Th2)*Th2) - (C*(1 - exp(-(time*Th2)))*Ph2)/((alpha - Th2)*Th2) + 
+  (B*(1 - exp(-(time*Th2)))*Ph2)/((beta - Th2)*Th2) + (C*(1 - exp(-(time*Th2)))*Ph2)/((gamma - Th2)*Th2) + 
+  (A*Ph2*(1 - (1 + alpha*time)/exp(alpha*time))*Th2)/(alpha^2*(alpha-Th2)^2) + (B*(1 - exp(-(beta*time)))*Ph2)/(beta*(-beta + Th2)) + 
+  (C*(1 - exp(-(gamma*time)))*Ph2)/(gamma*(-gamma + Th2));
+   
+   return(integ);
+                       
+}
+
+
+real threetc5kND_log_stan_BPp(real logK1, real logVnd, real logBPp, 
+                    real logk4, real logk5, real logvB, real time,
+                    real t0, 
+                    real A, real B, real C, 
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPnd;
+    real BPp;
+    real vB;
+    
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real tcorr;
+    
+    real pred;
+    
+
+    
+    K1 = exp(logK1);
+    Vnd = exp(logVnd);
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    vB = exp(logvB);
+    k5 = exp(logk5);
+    
+    k2 = K1 / Vnd - k5;
+    k3 = (k4 * (k2 + k5) * BPp)/K1;
+    KI = K1 * k5 / (k2 + k5);
+
+    Th1 = 0.5 * (k2 + k3 + k4 + k5 - sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2+k5)));
+    Th2 = 0.5 * (k2 + k3 + k4 + k5 + sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2+k5)));
+
+    Ph1 = (K1 * (k3 + k4 + k5 - Th1) - KI * Th2)/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4 - k5) + KI * Th1)/(Th2 - Th1);
+    Ph3 = KI;
+    
+    tcorr = time - t0;
+  
+  pred =  // 2TC contribution
+          (1-vB) * (
+            (tcorr > 0) * (             // Before t0 equal to 0
+              
+              // Before t0+ti
+              (tcorr < ti)*(1/ti)*(     
+                Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3)
+              ) +
+                
+              // After t0+ti 
+              (tcorr >= ti)*(1/ti)* (   
+                Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3) -
+                  Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3)
+              )
+            )
+          ) +
+          // Blood contribution
+          vB*bloodval;
+       
+  return(pred);
+}
+
+// S
+
+real threetc5kS_log_stan_BPp(real logK1, real logVnd, real logBPp, 
+                    real logk4, real logk5, real logvB, real time,
+                    real t0, 
+                    real A, real B, real C, 
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPnd;
+    real BPp;
+    real vB;
+    
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real tcorr;
+    
+    real pred;
+    
+
+    
+    K1 = exp(logK1);
+    Vnd = exp(logVnd);
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    vB = exp(logvB);
+    k5 = exp(logk5);
+    
+    k2 = (K1 - k5 * BPp)/Vnd;
+    k3 = BPp * (k4 + k5)/Vnd;
+    KI = K1 * k3 * k5 / (k2 * k4 + k2 * k5 + k3 * k5);
+  
+    Th1 = 0.5 * (k2 + k3 + k4 + k5 + sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 * k5)));
+    Th2 = 0.5 * (k2 + k3 + k4 + k5 - sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 * k5)));
+
+    Ph1 = (K1 * (k3 + k4 + k5 - Th1) - KI * Th2)/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4 - k5) + KI * Th1)/(Th2 - Th1);
+    Ph3 = KI;
+    
+    tcorr = time - t0;
+  
+  pred =  // 2TC contribution
+          (1-vB) * (
+            (tcorr > 0) * (             // Before t0 equal to 0
+              
+              // Before t0+ti
+              (tcorr < ti)*(1/ti)*(     
+                Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3)
+              ) +
+                
+              // After t0+ti 
+              (tcorr >= ti)*(1/ti)* (   
+                Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3) -
+                  Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3)
+              )
+            )
+          ) +
+          // Blood contribution
+          vB*bloodval;
+       
+  return(pred);
+}
+
+
+// P
+
+real threetc5kP_log_stan_BPp(real logK1, real logVnd, real logBPp, 
+                    real logk4, real logk5, real logvB, real time,
+                    real t0, 
+                    real A, real B, real C, 
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPnd;
+    real BPp;
+    real vB;
+    
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real tcorr;
+    
+    real pred;
+    
+
+    
+    K1 = exp(logK1);
+    Vnd = exp(logVnd);
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    vB = exp(logvB);
+    k5 = exp(logk5);
+    
+    k2 = K1 / Vnd;
+    k3 = (k4 * BPp)/Vnd;
+    KI = k5;
+  
+    Th1 = 0.5 * (k2 + k3 + k4 - sqrt((k2 + k3 + k4)^2 - 4 * k2 * k4));
+    Th2 = 0.5 * (k2 + k3 + k4 + sqrt((k2 + k3 + k4)^2 - 4 * k2 * k4));
+
+    Ph1 = (K1 * (k3 + k4 - Th1))/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4))/(Th2 - Th1);
+    Ph3 = KI;
+    
+    tcorr = time - t0;
+  
+  pred =  // 2TC contribution
+          (1-vB) * (
+            (tcorr > 0) * (             // Before t0 equal to 0
+              
+              // Before t0+ti
+              (tcorr < ti)*(1/ti)*(     
+                Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3)
+              ) +
+                
+              // After t0+ti 
+              (tcorr >= ti)*(1/ti)* (   
+                Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3) -
+                  Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3)
+              )
+            )
+          ) +
+          // Blood contribution
+          vB*bloodval;
+       
+  return(pred);
+}
+                    
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+// mixture models
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+real threetc5kND_log_stan_mix_BPp(real logK1, real logVnd, real logBPp, real logk4,
+                    real logk5, real logvB,
+                    real logBPpdiff, real logk4diff, real logk5diff,
+                    real prophigh, real proplow,
+                    real time,
+                    real t0,
+                    real A, real B, real C,
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPp;
+    real vB;
+
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real Th1low;
+    real Th2low;
+    real Ph1low;
+    real Ph2low;
+    real Ph3low;
+
+    real tcorr;
+
+    real predhigh;
+    real predlow;
+    real pred;
+    
+    real BPplow;
+    real k4low;
+    real k3low;
+    real k5low;
+    real KIlow;
+    real k5mean;
+    
+
+    K1 = exp(logK1);
+    Vnd = exp(logVnd);
+    vB = exp(logvB);
+
+    // High
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    k5 = exp(logk5);
+    
+    // Low
+    BPplow = exp(logBPp + logBPpdiff);
+    k4low = exp(logk4 + logk4diff);
+    k5low = exp(logk5 + logk5diff);
+    
+    // Assumed to be indepenpendent of genotypes
+    // note for myself: same no mather if mean(k5) or mean(k2)
+    k5mean = (k5 +k5low)/2;
+    k2 = K1 / Vnd - k5mean;
+
+    // High
+    k3 = (k4 * (k2 + k5) * BPp)/K1;
+    KI = K1 * k5 / (k2 + k5);
+
+    Th1 = 0.5 * (k2 + k3 + k4 + k5 - sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2+k5)));
+    Th2 = 0.5 * (k2 + k3 + k4 + k5 + sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2+k5)));
+
+    Ph1 = (K1 * (k3 + k4 + k5 - Th1) - KI * Th2)/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4 - k5) + KI * Th1)/(Th2 - Th1);
+    Ph3 = KI;
+    
+    
+    // Low
+    k3low = (k4low * (k2 + k5low) * BPplow)/K1;
+    KIlow = K1 * k5low / (k2 + k5low);
+    
+    Th1low = 0.5 * (k2 + k3low + k4low + k5low - sqrt((k2 + k3low + k4low + k5low)^2 - 4 * k4low * (k2 + k5low)));
+    Th2low = 0.5 * (k2 + k3low + k4low + k5low + sqrt((k2 + k3low + k4low + k5low)^2 - 4 * k4low * (k2 + k5low)));
+
+    Ph1low = (K1 * (k3low + k4low + k5low - Th1low) - KIlow * Th2low)/(Th2low - Th1low);
+    Ph2low = (K1 * (Th2low - k3low - k4low - k5low) + KIlow * Th1low)/(Th2low - Th1low);
+    Ph3low = KIlow;
+    
+
+    tcorr = time - t0;
+
+  predhigh =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC off CND
+      
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2,Ph3)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3)
+        )
+      ) 
+      
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+  
+  predlow =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        )
+      )
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+
+  pred = ( prophigh * predhigh ) + ( proplow * predlow );
+
+  return(pred);
+}
+                    
+real threetc5kS_log_stan_mix_BPp(real logK1, real logVnd, real logBPp, real logk4,
+                    real logk5, real logvB,
+                    real logBPpdiff, real logk4diff, real logk5diff,
+                    real prophigh, real proplow,
+                    real time,
+                    real t0,
+                    real A, real B, real C,
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPp;
+    real vB;
+
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real Th1low;
+    real Th2low;
+    real Ph1low;
+    real Ph2low;
+    real Ph3low;
+
+    real tcorr;
+
+    real predhigh;
+    real predlow;
+    real pred;
+    
+    real BPplow;
+    real k4low;
+    real k3low;
+    real k5low;
+    real KIlow;
+    
+    real k5mean;
+    real BPpmean;
+    
+
+    K1 = exp(logK1);
+    Vnd = exp(logVnd);
+    vB = exp(logvB);
+
+    // High
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    k5 = exp(logk5);
+    
+    // Low
+    BPplow = exp(logBPp + logBPpdiff);
+    k4low = exp(logk4 + logk4diff);
+    k5low = exp(logk5 + logk5diff);
+    
+    // Assumed to be indepenpendent of genotypes
+    // note for myself: same no mather if mean(k5) or mean(k2)
+    k5mean = (k5 + k5low)/2;
+    BPpmean = (BPp + BPplow)/2;
+
+    k2 = (K1 - k5mean * BPpmean)/Vnd;
+
+    
+    // High
+
+    k3 = BPp * (k4 + k5)/Vnd;
+    KI = K1 * k3 * k5 / (k2 * k4 + k2 * k5 + k3 * k5);
+  
+    Th1 = 0.5 * (k2 + k3 + k4 + k5 + sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 * k5)));
+    Th2 = 0.5 * (k2 + k3 + k4 + k5 - sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 * k5)));
+
+    Ph1 = (K1 * (k3 + k4 + k5 - Th1) - KI * Th2)/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4 - k5) + KI * Th1)/(Th2 - Th1);
+    Ph3 = KI;
+    
+    
+    // Low
+    
+    k3low = BPplow * (k4low + k5low)/Vnd;
+    KIlow = K1 * k3low * k5low / (k2 * k4low + k2 * k5low + k3low * k5low);
+    
+    Th1low = 0.5 * (k2 + k3low + k4low + k5low + sqrt((k2 + k3low + k4low + k5low)^2 - 4 * (k2 * k4low + k2 * k5low + k3low * k5low)));
+    Th2low = 0.5 * (k2 + k3low + k4low + k5low - sqrt((k2 + k3low + k4low + k5low)^2 - 4 * (k2 * k4low + k2 * k5low + k3low * k5low)));
+
+    Ph1low = (K1 * (k3low + k4low + k5low - Th1low) - KIlow * Th2low)/(Th2low - Th1low);
+    Ph2low = (K1 * (Th2low - k3low - k4low - k5low) + KIlow * Th1low)/(Th2low - Th1low);
+    Ph3low = KIlow;
+
+    
+
+    tcorr = time - t0;
+
+  predhigh =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC off CND
+      
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2,Ph3)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3)
+        )
+      ) 
+      
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+  
+  predlow =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        )
+      )
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+
+  pred = ( prophigh * predhigh ) + ( proplow * predlow );
+
+  return(pred);
+}
+
+real threetc5kP_log_stan_mix_BPp(real logK1, real logVnd, real logBPp, real logk4,
+                    real logk5, real logvB,
+                    real logBPpdiff, real logk4diff, real logk5diff,
+                    real prophigh, real proplow,
+                    real time,
+                    real t0,
+                    real A, real B, real C,
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPp;
+    real vB;
+
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real Th1low;
+    real Th2low;
+    real Ph1low;
+    real Ph2low;
+    real Ph3low;
+
+    real tcorr;
+
+    real predhigh;
+    real predlow;
+    real pred;
+    
+    real BPplow;
+    real k4low;
+    real k3low;
+    real k5low;
+    real KIlow;
+    
+
+    K1 = exp(logK1);
+    Vnd = exp(logVnd);
+    vB = exp(logvB);
+
+    // High
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    k5 = exp(logk5);
+
+
+    k2 = K1 / Vnd;
+    k3 = (k4 * BPp)/Vnd;
+    KI = k5;
+  
+    Th1 = 0.5 * (k2 + k3 + k4 - sqrt((k2 + k3 + k4)^2 - 4 * k2 * k4));
+    Th2 = 0.5 * (k2 + k3 + k4 + sqrt((k2 + k3 + k4)^2 - 4 * k2 * k4));
+
+    Ph1 = (K1 * (k3 + k4 - Th1))/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4))/(Th2 - Th1);
+    Ph3 = KI;
+    
+    
+    // Low
+    BPplow = exp(logBPp + logBPpdiff);
+    k4low = exp(logk4 + logk4diff);
+    k5low = exp(logk5 + logk5diff);
+    
+    k3low = (k4low * BPplow)/Vnd;
+    KIlow = k5low;
+    
+    Th1low = 0.5 * (k2 + k3low + k4low - sqrt((k2 + k3low + k4low)^2 - 4 * k4low * k2));
+    Th2low = 0.5 * (k2 + k3low + k4low + sqrt((k2 + k3low + k4low)^2 - 4 * k4low * k2));
+
+    Ph1low = (K1 * (k3low + k4low - Th1low))/(Th2low - Th1low);
+    Ph2low = (K1 * (Th2low - k3low - k4low))/(Th2low - Th1low);
+    Ph3low = KIlow;
+
+    
+
+    tcorr = time - t0;
+
+  predhigh =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC off CND
+      
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2,Ph3)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3)
+        )
+      ) 
+      
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+  
+  predlow =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        )
+      )
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+
+  pred = ( prophigh * predhigh ) + ( proplow * predlow );
+
+  return(pred);
+}
+
+real threetc5kND_log_stan_mix_BPp_k2(real logK1, real logVnd, real logBPp, real logk4,
+                    real logk5, real logvB,
+                    real logBPpdiff, real logk4diff, real logk5diff, real logVnddiff,
+                    real prophigh, real proplow,
+                    real time,
+                    real t0,
+                    real A, real B, real C,
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPp;
+    real vB;
+
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real Th1low;
+    real Th2low;
+    real Ph1low;
+    real Ph2low;
+    real Ph3low;
+
+    real tcorr;
+
+    real predhigh;
+    real predlow;
+    real pred;
+    
+    real BPplow;
+    real k4low;
+    real k3low;
+    real k5low;
+    real KIlow;
+    real k5mean;
+    real Vndlow;
+    real k2low;
+    
+
+    K1 = exp(logK1);
+    vB = exp(logvB);
+
+    // High
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    k5 = exp(logk5);
+    Vnd = exp(logVnd);
+    
+    // Low
+    BPplow = exp(logBPp + logBPpdiff);
+    k4low = exp(logk4 + logk4diff);
+    k5low = exp(logk5 + logk5diff);
+    Vndlow = exp(logVnd + logVnddiff);
+    
+    // Assumed to be indepenpendent of genotypes
+    // note for myself: same no mather if mean(k5) or mean(k2)
+    // k5mean = (k5 +k5low)/2;
+    // k2 = K1 / Vnd - k5mean;
+
+    // High
+    k2 = K1 / Vnd - k5;
+    k3 = (k4 * (k2 + k5) * BPp)/K1;
+    KI = K1 * k5 / (k2 + k5);
+
+    Th1 = 0.5 * (k2 + k3 + k4 + k5 - sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2+k5)));
+    Th2 = 0.5 * (k2 + k3 + k4 + k5 + sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2+k5)));
+
+    Ph1 = (K1 * (k3 + k4 + k5 - Th1) - KI * Th2)/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4 - k5) + KI * Th1)/(Th2 - Th1);
+    Ph3 = KI;
+    
+    
+    // Low
+    k2low = K1 / Vndlow - k5low;
+    k3low = (k4low * (k2low + k5low) * BPplow)/K1;
+    KIlow = K1 * k5low / (k2low + k5low);
+    
+    Th1low = 0.5 * (k2low + k3low + k4low + k5low - sqrt((k2low + k3low + k4low + k5low)^2 - 4 * k4low * (k2low + k5low)));
+    Th2low = 0.5 * (k2low + k3low + k4low + k5low + sqrt((k2low + k3low + k4low + k5low)^2 - 4 * k4low * (k2low + k5low)));
+
+    Ph1low = (K1 * (k3low + k4low + k5low - Th1low) - KIlow * Th2low)/(Th2low - Th1low);
+    Ph2low = (K1 * (Th2low - k3low - k4low - k5low) + KIlow * Th1low)/(Th2low - Th1low);
+    Ph3low = KIlow;
+    
+
+    tcorr = time - t0;
+
+  predhigh =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC off CND
+      
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2,Ph3)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3)
+        )
+      ) 
+      
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+  
+  predlow =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        )
+      )
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+
+  pred = ( prophigh * predhigh ) + ( proplow * predlow );
+
+  return(pred);
+}
+                    
+real threetc5kS_log_stan_mix_BPp_k2(real logK1, real logVnd, real logBPp, real logk4,
+                    real logk5, real logvB,
+                    real logBPpdiff, real logk4diff, real logk5diff, real logVnddiff,
+                    real prophigh, real proplow,
+                    real time,
+                    real t0,
+                    real A, real B, real C,
+                    real alpha, real beta, real gamma,
+                    real ti, real bloodval) {
+
+    real K1;
+    real k2;
+    real k3;
+    real k4;
+    real k5;
+    real KI;
+    real Vnd;
+    real BPp;
+    real vB;
+
+    real Th1;
+    real Th2;
+    real Ph1;
+    real Ph2;
+    real Ph3;
+    
+    real Th1low;
+    real Th2low;
+    real Ph1low;
+    real Ph2low;
+    real Ph3low;
+
+    real tcorr;
+
+    real predhigh;
+    real predlow;
+    real pred;
+    
+    real BPplow;
+    real k4low;
+    real k3low;
+    real k5low;
+    real KIlow;
+    real Vndlow;
+    real k2low;
+    
+    // real k5mean;
+    // real BPpmean;
+    
+
+    K1 = exp(logK1);
+    vB = exp(logvB);
+
+    // High
+    BPp = exp(logBPp);
+    k4 = exp(logk4);
+    k5 = exp(logk5);
+    Vnd = exp(logVnd);
+    
+    // Low
+    BPplow = exp(logBPp + logBPpdiff);
+    k4low = exp(logk4 + logk4diff);
+    k5low = exp(logk5 + logk5diff);
+    Vndlow = exp(logVnd + logVnddiff);
+    
+    // Assumed to be indepenpendent of genotypes
+    // note for myself: same no mather if mean(k5) or mean(k2)
+    // k5mean = (k5 + k5low)/2;
+    // BPpmean = (BPp + BPplow)/2;
+
+    
+    // High
+
+    k2 = (K1 - k5 * BPp)/Vnd;
+    k3 = BPp * (k4 + k5)/Vnd;
+    KI = K1 * k3 * k5 / (k2 * k4 + k2 * k5 + k3 * k5);
+  
+    Th1 = 0.5 * (k2 + k3 + k4 + k5 + sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 * k5)));
+    Th2 = 0.5 * (k2 + k3 + k4 + k5 - sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 * k5)));
+
+    Ph1 = (K1 * (k3 + k4 + k5 - Th1) - KI * Th2)/(Th2 - Th1);
+    Ph2 = (K1 * (Th2 - k3 - k4 - k5) + KI * Th1)/(Th2 - Th1);
+    Ph3 = KI;
+    
+    
+    // Low
+    
+    k2low = (K1 - k5low * BPplow)/Vndlow;
+    k3low = BPplow * (k4low + k5low)/Vndlow;
+    KIlow = K1 * k3low * k5low / (k2low * k4low + k2low * k5low + k3low * k5low);
+    
+    Th1low = 0.5 * (k2low + k3low + k4low + k5low + sqrt((k2low + k3low + k4low + k5low)^2 - 4 * (k2low * k4low + k2low * k5low + k3low * k5low)));
+    Th2low = 0.5 * (k2low + k3low + k4low + k5low - sqrt((k2low + k3low + k4low + k5low)^2 - 4 * (k2low * k4low + k2low * k5low + k3low * k5low)));
+
+    Ph1low = (K1 * (k3low + k4low + k5low - Th1low) - KIlow * Th2low)/(Th2low - Th1low);
+    Ph2low = (K1 * (Th2low - k3low - k4low - k5low) + KIlow * Th1low)/(Th2low - Th1low);
+    Ph3low = KIlow;
+
+    
+
+    tcorr = time - t0;
+
+  predhigh =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC off CND
+      
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2,Ph3)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1, Th2, Ph1, Ph2, Ph3)
+        )
+      ) 
+      
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+  
+  predlow =  
+  (1-vB) * (
+    (tcorr > 0) * (             // Before t0 equal to 0
+
+      // 2TC
+        // Before t0+ti
+        (tcorr < ti)*(1/ti)*(
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        ) +
+
+        // After t0+ti
+        (tcorr >= ti)*(1/ti)* (
+          Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low) -
+            Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma,
+                           Th1low, Th2low, Ph1low, Ph2low, Ph3low)
+        )
+      )
+  ) +
+  // Blood contribution
+  vB *  bloodval;
+
+  pred = ( prophigh * predhigh ) + ( proplow * predlow );
+
+  return(pred);
+}
+
+"
+```
+
+
+# Fitting
+
+
+## 5. 3TC5k
+
+### 5.1 Prep for all variants 
+
+#### One TAC
+
+```{r}
+dat_i <- simba_modeldata %>% 
+  filter(pet==pet[5426]) %>% 
+  filter(region=="Frontal") %>% 
+  mutate(sqrtinvw = sqrt(1/weights)) 
+
+```
+
+##### Functions
+
+```{r}
+Integral_Feng_3TC5K <- function(t, A, B, C, alpha, beta, gamma, 
+                                 Th1, Th2, Ph1, Ph2, Ph3) {
+
+  (B*(1 - exp(-(alpha*t)))*Ph3)/alpha^2 + (C*(1 - exp(-(alpha*t)))*Ph3)/alpha^2 + (A*(-1 + exp(-(alpha*t)))*Ph3)/alpha^3 + 
+  (B*(-1 + exp(-(beta*t)))*Ph3)/beta^2 + (C*(-1 + exp(-(gamma*t)))*Ph3)/gamma^2 + (A*Ph3*t)/alpha^2 - (B*Ph3*t)/alpha + (B*Ph3*t)/beta - 
+  (C*Ph3*t)/alpha + (C*Ph3*t)/gamma - (A*Ph3*(1 - (1 + alpha*t)/exp(alpha*t)))/alpha^3 - (A*(1 - exp(-(alpha*t)))*Ph1)/(alpha*(alpha-Th1)^2) - 
+  (A*Ph1*(1 - (1 + alpha*t)/exp(alpha*t)))/(alpha*(alpha-Th1)^2) + (B*(1 - exp(-(alpha*t)))*Ph1)/(alpha*(alpha - Th1)) + 
+  (C*(1 - exp(-(alpha*t)))*Ph1)/(alpha*(alpha - Th1)) + (A*(1 - exp(-(t*Th1)))*Ph1)/((alpha-Th1)^2*Th1) - 
+  (B*(1 - exp(-(t*Th1)))*Ph1)/((alpha - Th1)*Th1) - (C*(1 - exp(-(t*Th1)))*Ph1)/((alpha - Th1)*Th1) + (B*(1 - exp(-(t*Th1)))*Ph1)/((beta - Th1)*Th1) + 
+  (C*(1 - exp(-(t*Th1)))*Ph1)/((gamma - Th1)*Th1) + (A*Ph1*(1 - (1 + alpha*t)/exp(alpha*t))*Th1)/(alpha^2*(alpha-Th1)^2) + 
+  (B*(1 - exp(-(beta*t)))*Ph1)/(beta*(-beta + Th1)) + (C*(1 - exp(-(gamma*t)))*Ph1)/(gamma*(-gamma + Th1)) - 
+  (A*(1 - exp(-(alpha*t)))*Ph2)/(alpha*(alpha-Th2)^2) - (A*Ph2*(1 - (1 + alpha*t)/exp(alpha*t)))/(alpha*(alpha-Th2)^2) + 
+  (B*(1 - exp(-(alpha*t)))*Ph2)/(alpha*(alpha - Th2)) + (C*(1 - exp(-(alpha*t)))*Ph2)/(alpha*(alpha - Th2)) + 
+  (A*(1 - exp(-(t*Th2)))*Ph2)/((alpha-Th2)^2*Th2) - (B*(1 - exp(-(t*Th2)))*Ph2)/((alpha - Th2)*Th2) - (C*(1 - exp(-(t*Th2)))*Ph2)/((alpha - Th2)*Th2) + 
+  (B*(1 - exp(-(t*Th2)))*Ph2)/((beta - Th2)*Th2) + (C*(1 - exp(-(t*Th2)))*Ph2)/((gamma - Th2)*Th2) + 
+  (A*Ph2*(1 - (1 + alpha*t)/exp(alpha*t))*Th2)/(alpha^2*(alpha-Th2)^2) + (B*(1 - exp(-(beta*t)))*Ph2)/(beta*(-beta + Th2)) + 
+  (C*(1 - exp(-(gamma*t)))*Ph2)/(gamma*(-gamma + Th2))
+  
+}
+```
+
+Function to prepare the data for plotting (see nls fit for single TACs):
+
+```{r}
+plot_fit <- function(pet, region, data, fit) {
+  
+  preddata <- tibble(
+    frame_mid = seq(min(data$frame_mid),
+                max(data$frame_mid),
+                length.out=1000)
+  ) %>% 
+    mutate(meanblood = approx(data$frame_mid, data$meanblood, xout = .$frame_mid)$y) %>% 
+    mutate(TAC = predict(fit, newdata=list(frame_mid = .$frame_mid,
+                                           meanblood = .$meanblood)))
+
+  
+  ggplot(data, aes(x=frame_mid, y=TAC)) +
+    geom_point(aes(size=weights)) +
+    geom_line(colour="red", data=preddata) +
+    labs(title = paste0(pet, ": ", region,",Type: ", data$genotype))
+  
+}
+```
+
+#### Fixed priors
+
+```{r}
+simba_prior_threetc5k_fixed <- c(
+  
+  set_prior("normal(-2, 0.5)", nlpar = "logK1"),
+  set_prior("normal(-0.3, 0.5)", nlpar = "logVnd"),
+  set_prior("normal(0.7, 0.5)", nlpar = "logBPp"),
+  set_prior("normal(-3, 0.5)", nlpar = "logk4"),
+  set_prior("normal(-4, 1)", nlpar = "logk5"),
+  set_prior("normal(-3, 0.25)", nlpar = "logvB", ub = -2.5), # upper limit
+  
+  set_prior("normal(0, 0.3)", nlpar = "logK1", class = "sd", group="sub"),
+  set_prior("normal(0, 0.2)", nlpar = "logVnd", class = "sd", group="sub"),
+  set_prior("normal(0, 0.5)", nlpar = "logBPp", class = "sd", group="sub"),
+  set_prior("normal(0, 0.2)", nlpar = "logk4", class = "sd", group="sub"),
+  set_prior("normal(0, 0.5)", nlpar = "logk5", class = "sd", group="sub"), # increased here
+  set_prior("normal(0, 0.1)", nlpar = "logvB", class = "sd", group="sub"),
+  
+  set_prior("normal(0, 0.05)", nlpar = "logK1", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logVnd", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logBPp", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logk4", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logk5", class = "sd", group="pet:region"),
+  
+  set_prior("normal(0, 0.1)", nlpar = "logVnd", class = "sd", group="region"),
+  set_prior("normal(0, 0.1)", nlpar = "logk4", class = "sd", group="region"),
+  set_prior("normal(0, 0.1)", nlpar = "logk5", class = "sd", group="region"),
+  set_prior("normal(0, 0.1)", nlpar = "logvB", class = "sd", group="region"),
+  
+  set_prior("normal(0, 0.2)", nlpar = "logvB", class = "sd", group="pet"),
+  
+  #set_prior("normal(0, 0.3)", coef="regionAccumbens",    nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionAmygdala",     nlpar="logK1"),
+  #set_prior("normal(0, 0.3)", coef="regionCaudate",      nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionCerebellum",   nlpar="logK1"),
+  #set_prior("normal(0, 0.3)", coef="regionFrontal",      nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionHippocampus",  nlpar="logK1"),
+  #set_prior("normal(0, 0.3)", coef="regionInsula",       nlpar="logK1"),
+  #set_prior("normal(0, 0.3)", coef="regionPCC",          nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionPutamen",      nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionTemporal",     nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionThalamus",     nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionOccipital",     nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionParietal",     nlpar="logK1"),
+  
+  #set_prior("normal(0, 0.3)", coef="regionAccumbens",    nlpar="logBPnd"),
+  set_prior("normal(0, 0.3)", coef="regionAmygdala",     nlpar="logBPp"),
+  #set_prior("normal(0, 0.3)", coef="regionCaudate",      nlpar="logBPnd"),
+  set_prior("normal(0, 0.3)", coef="regionCerebellum",   nlpar="logBPp"),
+  #set_prior("normal(0, 0.3)", coef="regionFrontal",      nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionHippocampus",  nlpar="logBPp"),
+  #set_prior("normal(0, 0.3)", coef="regionInsula",       nlpar="logBPnd"),
+  #set_prior("normal(0, 0.3)", coef="regionPCC",          nlpar="logBPnd"),
+  set_prior("normal(0, 0.3)", coef="regionPutamen",      nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionTemporal",     nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionThalamus",     nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionOccipital",     nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionParietal",     nlpar="logBPp"),
+  
+  set_prior("normal(0, 0.1)", coef="Age_dec_c", nlpar="logK1"),
+  set_prior("normal(0, 0.1)", coef="Age_dec_c", nlpar="logBPp"),
+  set_prior("normal(0, 0.1)", coef="Age_dec_c", nlpar="logVnd"),
+  set_prior("normal(0, 0.1)", coef="Age_dec_c", nlpar="logk5"),
+  
+  set_prior("normal(0, 1)", coef="LPSpost", nlpar="logBPp"),
+  set_prior("normal(0, 1)", coef="LPSpost", nlpar="logk5"),
+  set_prior("normal(0, 0.2)", coef="LPSpost", nlpar="logK1"),
+  #set_prior("normal(0, 0.2)", coef="LPSpost", nlpar="logVnd"),
+  
+  set_prior("normal(-0.5, 0.5)", coef="genotypeMAB", nlpar="logBPp"),
+  #set_prior("normal(-1, 0.5)", coef="genotypeLAB", nlpar="logBPp"),
+  
+  set_prior("normal(0.5, 0.5)", coef="genotypeMAB", nlpar="logk4"),
+  #set_prior("normal(1, 0.5)", coef="genotypeLAB", nlpar="logk4"),
+  
+  set_prior("normal(-0.5, 0.5)", coef="genotypeMAB", nlpar="logk5"),
+  #set_prior("normal(-1, 0.5)", coef="genotypeLAB", nlpar="logk5"),
+
+  set_prior("normal(-1, 0.2)", dpar = "sigma"),
+  set_prior("normal(0, 0.3)", dpar = "sigma", class="sd", group="pet"),
+  set_prior("normal(0, 0.1)", dpar = "sigma", class="sd", group="region"),
+  
+  set_prior("normal(0, 0.3)", coef="logRegSize_c", dpar = "sigma", class="b"),
+  set_prior("normal(0, 0.5)", coef="logInjRad_c", dpar = "sigma", class="b"),
+  set_prior("normal(0, 0.3)", coef="logdur_c", dpar = "sigma", class="b"),
+  
+  set_prior("student_t(3, 0, 2.5)", coef="sframe_mid_1", dpar = "sigma", class="b"),
+  set_prior("student_t(3, 0, 2.5)", dpar = "sigma", class="sds")#,
+  
+  #set_prior("lkj(1)", class="cor", group = "sub"),
+  #set_prior("lkj(2)", class="cor", group = "region"),
+  #set_prior("lkj(2)", class="cor", group = "pet:region")
+  )
+
+```
+
+#### Mixed
+
+```{r}
+simba_prior_threetc5k <- c(
+  
+  set_prior("normal(-2, 0.5)", nlpar = "logK1"),
+  set_prior("normal(-0.3, 0.5)", nlpar = "logVnd"),
+  set_prior("normal(0, 0.5)", nlpar = "logBPp"),
+  set_prior("normal(-3, 0.5)", nlpar = "logk4"),
+  set_prior("normal(-4.5, 1)", nlpar = "logk5"),
+  set_prior("normal(-3, 0.25)", nlpar = "logvB", ub = -2.5), # upper limit
+  
+  # Genotype differences
+  set_prior("normal(-1, 0.5)", nlpar = "logBPpdiff"),
+  set_prior("normal(1, 0.5)", nlpar = "logk4diff"),
+  set_prior("normal(-1, 0.5)", nlpar = "logk5diff"),
+  
+  set_prior("normal(0, 0.3)", nlpar = "logK1", class = "sd", group="sub"),
+  set_prior("normal(0, 0.1)", nlpar = "logVnd", class = "sd", group="sub"),
+  set_prior("normal(0, 0.5)", nlpar = "logBPp", class = "sd", group="sub"),
+  set_prior("normal(0, 0.1)", nlpar = "logk4", class = "sd", group="sub"),
+  set_prior("normal(0, 0.5)", nlpar = "logk5", class = "sd", group="sub"), # increased here
+  set_prior("normal(0, 0.2)", nlpar = "logvB", class = "sd", group="sub"),
+  
+  set_prior("normal(0, 0.05)", nlpar = "logK1", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logVnd", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logBPp", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logk4", class = "sd", group="pet:region"),
+  set_prior("normal(0, 0.05)", nlpar = "logk5", class = "sd", group="pet:region"),
+  
+  set_prior("normal(0, 0.1)", nlpar = "logVnd", class = "sd", group="region"),
+  set_prior("normal(0, 0.1)", nlpar = "logk4", class = "sd", group="region"),
+  set_prior("normal(0, 0.1)", nlpar = "logk5", class = "sd", group="region"),
+  set_prior("normal(0, 0.1)", nlpar = "logvB", class = "sd", group="region"),
+  
+  set_prior("normal(0, 0.2)", nlpar = "logvB", class = "sd", group="pet"),
+  
+  set_prior("normal(0, 0.3)", coef="regionAccumbens",    nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionAmygdala",     nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionCaudate",      nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionCerebellum",   nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionFrontal",      nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionHippocampus",  nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionInsula",       nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionPCC",          nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionPutamen",      nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionTemporal",     nlpar="logK1"),
+  set_prior("normal(0, 0.3)", coef="regionThalamus",     nlpar="logK1"),
+  
+  set_prior("normal(0, 0.3)", coef="regionAccumbens",    nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionAmygdala",     nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionCaudate",      nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionCerebellum",   nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionFrontal",      nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionHippocampus",  nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionInsula",       nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionPCC",          nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionPutamen",      nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionTemporal",     nlpar="logBPp"),
+  set_prior("normal(0, 0.3)", coef="regionThalamus",     nlpar="logBPp"),
+  
+  set_prior("normal(0, 0.1)", coef="Age_dec_c", nlpar="logK1"),
+  set_prior("normal(0, 0.1 )", coef="Age_dec_c", nlpar="logBPp"),
+  set_prior("normal(0, 0.1 )", coef="Age_dec_c", nlpar="logVnd"),
+  set_prior("normal(0, 0.1 )", coef="Age_dec_c", nlpar="logk5"),
+  
+  # set_prior("normal(0, 0.5 )", coef="GenotypeHAB", nlpar="logBPnd"),
+  # set_prior("normal(0, 0.5 )", coef="GenotypeLAB", nlpar="logBPnd"),
+  # 
+  # set_prior("normal(0, 0.5 )", coef="GenotypeHAB", nlpar="logk4"),
+  # set_prior("normal(0, 0.5 )", coef="GenotypeLAB", nlpar="logk4"),
+  # 
+  # set_prior("normal(0, 0.3 )", coef="GenotypeHAB", nlpar="logKb"),
+  # set_prior("normal(0, 0.3 )", coef="GenotypeLAB", nlpar="logKb"),
+  # 
+  # set_prior("normal(0, 0.05)",  coef="SexMale", nlpar="logK1"),
+  # set_prior("normal(0, 0.05 )", coef="SexMale", nlpar="logBPnd"),
+  # set_prior("normal(0, 0.05 )", coef="SexMale", nlpar="logVnd"),
+
+  set_prior("normal(-1, 0.2)", dpar = "sigma"),
+  set_prior("normal(0, 0.3)", dpar = "sigma", class="sd", group="pet"),
+  set_prior("normal(0, 0.1)", dpar = "sigma", class="sd", group="region"),
+  
+  set_prior("normal(0, 0.3)", coef="logRegSize_c", dpar = "sigma", class="b"),
+  set_prior("normal(0, 0.5)", coef="logInjRad_c", dpar = "sigma", class="b"),
+  set_prior("normal(0, 0.3)", coef="logdur_c", dpar = "sigma", class="b"),
+  
+  set_prior("student_t(3, 0, 4)", coef="sframe_mid_1", dpar = "sigma", class="b"),
+  set_prior("student_t(3, 0, 2.5)", dpar = "sigma", class="sds")#,
+  
+  #set_prior("lkj(1)", class="cor", group = "sub"),
+  #set_prior("lkj(2)", class="cor", group = "region"),
+  #set_prior("lkj(2)", class="cor", group = "pet:region")
+  )
+```
+
+
+### 5.2 ND 
+
+#### 5.2.1 NLS
+
+###### Function
+
+```{r}
+Model_FengConv_3TC5kND <- function(time, t0, A, B, C, alpha, beta, gamma, ti, 
+                               bloodval, 
+                               logK1, logVnd, logBPp, logk4,logk5, logvB) {
+  
+  
+  K1 = exp(logK1)
+  Vnd = exp(logVnd)
+  BPp = exp(logBPp)
+  k4 = exp(logk4)
+  k5 = exp(logk5)
+  vB = exp(logvB)
+  
+  k2 = K1 / Vnd -k5
+  k3 = BPp * k4 * (k2 + k5)/K1
+  
+  th1 <- ((k2 + k3 + k4 + k5) - sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2 + k5))) / 2
+
+  th2 <- ((k2 + k3 + k4 + k5) + sqrt((k2 + k3 + k4 + k5)^2 - 4 * k4 * (k2 + k5))) / 2
+  
+  ph1 <- (K1 * (k3 + k4 + k5 - th1) - th2 * K1 * k5 / (k2 + k5))/(th2 - th1)
+  
+  ph2 <- (K1 * (th2 - k3 - k4 - k5) + th1 * K1 * k5 / (k2 + k5))/(th2 - th1)
+  
+  ph3 <- K1 * k5 / (k2 + k5)
+  
+  tcorr <- time - t0
+  
+  # 2TC contribution
+  (1-vB) * (
+    (tcorr > 0) * (             # Before t0 equal to 0
+      
+      # Before t0+ti
+      (tcorr < ti)*(1/ti)*(     
+        Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3)
+      ) +
+        
+      # After t0+ti 
+      (tcorr >= ti)*(1/ti)* (   
+        Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3) -
+          Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3)
+      )
+    )
+  ) +
+  # Blood contribution
+  vB*bloodval
+  
+}
+```
+
+
+###### Fitting
+
+```{r, eval=FALSE}
+plan(multisession, workers = 12) # Run this in parallel across 6 cores.
+
+modeldat_nested <- simba_modeldata %>% 
+  group_by(pet, region) %>% 
+  nest() %>%  
+  ungroup() %>% # We need to ungroup before running the parallel functions with future_map
+    mutate(fit = future_map(data, ~nls.multstart::nls_multstart(
+      TAC ~ Model_FengConv_3TC5kND(frame_mid, t0, A, B, C, alpha, beta, gamma, ti,  #t_tac, t0
+                               meanblood, 
+                               logK1, logVnd, logBPp, logk4, logk5, logvB), data = .x,
+      start_lower = c(logK1=-3.5, logVnd=0, logBPp=0, logk4=-5, logk5=-7.5, logvB=-3.5),
+      start_upper = c(logK1=0, logVnd=3, logBPp=4, logk4=-1, logk5=-1, logvB=-2.5),
+      lower = c(logK1=-3.5, logVnd=-2.5, logBPp=-2, logk4=-5, logk5=-7.5, logvB=-3.5),
+      upper = c(logK1=0, logVnd=1, logBPp=4, logk4=-1, logk5=-1, logvB=-2.5),
+      modelweights = weights, iter=40, supp_errors = "Y")))
+
+
+saveRDS(modeldat_nested, "../DerivedData/nlsfitsND.rds")
+```
+
+counting the param values for all genotypes together:
+
+```{r}
+modeldat_pars <- readRDS("../DerivedData/nlsfitsND.rds") %>% 
+  mutate(par = map(fit, ~as.data.frame(as.list(coef(.x))))) %>% 
+  unnest(data) %>%
+  select(pet, region, par,genotype) %>% 
+  unnest(par)
+
+nls <- modeldat_pars %>%
+  gather(Parameter, Value, -pet, -region, -genotype) %>% 
+  ggplot(aes(x=Value, fill=Parameter)) + 
+  geom_histogram(colour="black") +
+  facet_wrap(~Parameter, scales="free")
+
+ggsave("nls3tc5kND.pdf", plot = nls, width = 10, height = 7, dpi = 300)
+nls
+
+```
+
+counting param values for each genotype separately:
+
+```{r}
+nls <- modeldat_pars %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB"))) %>% 
+  pivot_longer(
+    cols = -c(pet, region, genotype),
+    names_to = "Parameter",
+    values_to = "Value"
+  ) %>% 
+  ggplot(aes(x = Value, fill=Parameter)) + 
+  geom_histogram(colour = "black") +
+  facet_grid(genotype ~ Parameter, scales = "free")
+
+ggsave("nlsgenotype3tc5kND.pdf", plot = nls, width = 10, height = 7, dpi = 300)
+nls
+```
+
+```{r}
+plotdat <- readRDS("../DerivedData/nlsfitsND.rds") %>%
+  slice(sample(1:nrow(.), size = 20)) 
+
+pmap(list(plotdat$pet, plotdat$region, plotdat$data, plotdat$fit),
+     plot_fit)
+  
+```
+
+#### 5.2.2 One Tac Bayesian
+
+```{r, eval=TRUE}
+set.seed(1337)
+
+threetc5kND_prior <- c(
+  set_prior("normal(-2, 0.5)", nlpar = "logK1"),
+  set_prior("normal(-0.3, 0.5)", nlpar = "logVnd"),
+  set_prior("normal(0.7, 0.5)", nlpar = "logBPp"),
+  set_prior("normal(-3, 0.5)", nlpar = "logk4"),
+  set_prior("normal(-4, 1)", nlpar = "logk5"),
+  set_prior("normal(-3, 0.25)", nlpar = "logvB"),
+  
+  set_prior("normal(0, 1)", dpar = "sigma", coef="sqrtinvw"))
+
+
+threetc5kND_fit_formula <- bf( TAC ~ threetc5kND_log_stan(logK1, logVnd, logBPp, logk4,
+                                                  logk5, logvB, 
+                                                  frame_mid, 
+                                    t0, 
+                                    A, B, C, 
+                                    alpha, beta, gamma, 
+                                    ti, meanblood),
+     sigma ~ 0 + sqrtinvw,
+     # Nonlinear variables
+     logK1 + logVnd + logBPp + logk4 + logk5 + logvB ~ 1,
+     # Nonlinear fit
+     nl = TRUE)
+
+get_prior(threetc5kND_fit_formula, data=dat_i, family = gaussian())
+
+make_stancode(threetc5kND_fit_formula,
+  family=gaussian(), 
+  data = dat_i,
+  prior = threetc5kND_prior,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan, 
+                     block="functions"))
+
+
+# get_prior(twotcm1k_fit_formula,
+#   family=gaussian(), 
+#   data = modeldat)
+
+
+    
+threetc5kND_fit <- brm(
+  threetc5kND_fit_formula,
+  family=gaussian(),
+  data = dat_i,
+  prior = threetc5kND_prior,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+             block="functions"),
+  control = list(adapt_delta=0.90),
+  chains = 2,
+  cores = 2,
+  iter = 1000,
+  backend = "rstan", init = 0)
+
+  
+
+#summary(threetc5kND_fit)
+
+
+```
+
+
+```{r, message=FALSE, warning=FALSE, results="hide", eval=TRUE}
+brms::expose_functions(threetc5kND_fit, vectorize=TRUE, verbose = F, 
+                       show_compiler_warnings = F)
+```
+
+```{r, eval=TRUE}
+pred <- predict(threetc5kND_fit) %>% 
+  as_tibble() %>% 
+  select(P_L95 = "Q2.5",
+         P_U95 = "Q97.5")
+
+fitted <- fitted(threetc5kND_fit) %>% 
+  as_tibble() %>% 
+  select(Estimate, 
+         F_L95 = "Q2.5",
+         F_U95 = "Q97.5")
+
+dat_i_fitted <- dat_i %>% 
+  bind_cols(pred) %>% 
+  bind_cols(fitted)
+
+ggplot(dat_i_fitted, aes(x=frame_mid, y=TAC)) +
+  geom_point() +
+  geom_ribbon(aes(ymin=P_L95, ymax=P_U95), alpha=0.1) +
+  geom_ribbon(aes(ymin=F_L95, ymax=F_U95), alpha=0.2) +
+  geom_line(aes(y=Estimate)) 
+
+
+```
+
+#### 5.2.3 Fixed genotype levels
+
+```{r} #univariate
+# Nonlinear variables
+                              logK1 ~ 1 + region + Age_dec_c + (1|sub) + 
+                                  (1|pet:region),
+                              logBPp ~  1 + region + Age_dec_c + genotype + 
+                                         (1|sub) + (1|pet:region),
+                              logVnd ~ 1 + Age_dec_c + (1|region) + (1|sub) +
+                                (1|pet:region),
+                              logk4 ~ 1 + genotype + (1|region) + (1|sub) +
+                                (1|pet:region),
+                              logk5 ~ 1 + genotype + Age_dec_c + (1|sub) + 
+                              (1|region) + (1|pet:region),
+                              logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+                              # Nonlinear fit
+                              nl = TRUE, center = TRUE)
+```
+
+
+##### Prep
+
+```{r}
+simba_fit_formula_3tc5kND_fixed <- bf( TAC ~ threetc5kND_log_stan_BPp(logK1, logVnd, logBPp, logk4,
+                                                  logk5, logvB, 
+                                                  frame_mid, 
+                                    t0, 
+                                    A, B, C, 
+                                    alpha, beta, gamma, 
+                                    ti, meanblood),
+                              lf(sigma ~ 1 + s(frame_mid) + logRegSize_c + 
+                                   logInjRad_c + logdur_c +
+                                 (1 | region) + (1 | pet), center = FALSE),
+                              
+
+                              # Nonlinear variables
+# univariate
+                              # logK1 ~ 1 + region + Age_dec_c + (1|sub) +
+                              #     (1|pet:region),
+                              # logBPp ~  1 + region + Age_dec_c + genotype +
+                              #            (1|sub) + (1|pet:region),
+                              # logVnd ~ 1 + Age_dec_c + (1|region) + (1|sub) +
+                              #   (1|pet:region),
+                              # logk4 ~ 1 + genotype + (1|region) + (1|sub) +
+                              #   (1|pet:region),
+                              # logk5 ~ 1 + genotype + Age_dec_c + (1|sub) +
+                              # (1|region) + (1|pet:region),
+                              # logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+                              # # Nonlinear fit
+                              # nl = TRUE, center = TRUE)
+
+# multivariate
+#                               logK1 ~ 1 + region + Age_dec_c + (1|k|sub) + 
+#                                   (1|l|pet:region),
+#                               logBPp ~  1 + region + Age_dec_c + genotype +
+#                                          (1|k|sub) + (1|l|pet:region),
+#                               logVnd ~ 1 + Age_dec_c + (1|m|region) + (1|k|sub) +
+#                                 (1|l|pet:region),
+#                               logk4 ~ 1 + genotype + (1|m|region) + (1|k|sub) +
+#                                 (1|l|pet:region),
+#                               logk5 ~ 1 + genotype + Age_dec_c + (1|k|sub) + 
+#                               (1|m|region) + (1|l|pet:region),
+#                               logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+#                               # Nonlinear fit
+#                               nl = TRUE, center = TRUE)
+
+# univariate with LPS
+                              logK1 ~ 1 + region + Age_dec_c + (1|sub) + LPS +
+                                  (1|pet:region),
+                              logBPp ~  1 + region + Age_dec_c + genotype + LPS +
+                                         (1|sub) + (1|pet:region),
+                              logVnd ~ 1 + Age_dec_c + (1|region) + (1|sub) +
+                                (1|pet:region),
+                              logk4 ~ 1 + genotype + (1|region) + (1|sub) + 
+                                (1|pet:region),
+                              logk5 ~ 1 + genotype + Age_dec_c + (1|sub) + LPS +
+                              (1|region) + (1|pet:region),
+                              logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+                              # Nonlinear fit
+                              nl = TRUE, center = TRUE)
+
+# multivariate with LPS for BPp and k4
+#                               logK1 ~ 1 + region + Age_dec_c + (1|k|sub) + 
+#                                   (1|l|pet:region),
+#                               logBPp ~  1 + region + Age_dec_c + genotype + LPS +
+#                                          (1|k|sub) + (1|l|pet:region),
+#                               logVnd ~ 1 + Age_dec_c + (1|m|region) + (1|k|sub) +
+#                                 (1|l|pet:region),
+#                               logk4 ~ 1 + genotype + (1|m|region) + (1|k|sub) + LPS +
+#                                 (1|l|pet:region),
+#                               logk5 ~ 1 + genotype + Age_dec_c + (1|k|sub) + 
+#                               (1|m|region) + (1|l|pet:region),
+#                               logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+#                               # Nonlinear fit
+#                               nl = TRUE, center = TRUE)
+  
+
+sc <- make_stancode(simba_fit_formula_3tc5kND_fixed,
+  family=gaussian(),
+  data = simba_modeldata,
+  prior = simba_prior_threetc5k_fixed,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+                     block="functions"))
+
+# writeLines(sc, "stancode_unmod_LL_2.stan")
+
+stand <- brms::make_standata(simba_fit_formula_3tc5kND_fixed, 
+                          data = simba_modeldata, 
+                          family=gaussian(), 
+                          prior = simba_prior_threetc5k_fixed)
+
+stand_list <- list()
+for (t in names(stand)) {
+  stand_list[[t]] <- stand[[t]]
+}
+```
+
+##### Fit
+
+```{r}
+rm(fit_3tc5kND_fixed)
+job::job({
+  fit_3tc5kND_fixed <- brm(
+    simba_fit_formula_3tc5kND_fixed,
+    family=gaussian(), 
+    data = simba_modeldata, 
+    prior = simba_prior_threetc5k_fixed,
+    stanvars = stanvar(scode = three_compartment_5k_fengconv_stan, 
+               block="functions"),
+    backend = "cmdstanr", init = 0, iter = 1000, warmup = 300,
+    chains=2, cores=2, threads = threading(5), seed =  765)
+  
+  saveRDS(fit_3tc5kND_fixed, "../DerivedData/3tc5kND_fit_fixed.rds")
+})
+```
+
+```{r}
+fit_3tc5kND_fixed <- readRDS("../DerivedData/3tc5kND_fit_fixed.rds")
+#fit_3tc5kND_fixed <- readRDS("../DerivedData/3tc5kND_fit_sub_fixed.rds")
+#fit_3tc5kND_fixed <- readRDS("../DerivedData/3tc5kND_fit_sub_fixed_multivariate.rds")
+#fit_3tc5kND_fixed <- readRDS("../DerivedData/3tc5kND_fit_sub_fixed_multivariate_LPS.rds")
+#fit_3tc5kND_fixed <- readRDS("../DerivedData/3tc5kND_fit_LPSpairs_fixed_multivariate_LPS.rds")
+print(summary(fit_3tc5kND_fixed, digits=3))
+```
+
+```{r}
+#duration one chain for 15 data points, with fixed genotype levels
+as.integer(fit_3tc5kND_fixed$fit@metadata$metadata$time$total[1])/60/60
+#duration one chain for 15 data points, with mixed genotype levels
+as.integer(fit4_threetc5kND$fit@metadata$metadata$time$total[1])/60/60
+```
+
+
+##### Plot genotype difs
+
+```{r, fig.height=6, fig.width=6}
+fit <- fit_3tc5kND_fixed
+fe3_3tc5kND_fixed_genotype <- fixef(fit) %>% 
+  as_tibble(rownames="Parameter") %>% 
+  filter(str_detect(Parameter, "genotype")) %>% 
+  mutate(PK_Parameter = str_match(Parameter, "log(\\w*)_")[,2]) %>% 
+  mutate(Genotype_Comparison = str_match(Parameter, "_genotype(\\w*)")[,2],
+         Genotype_Comparison = paste0("HAB - ", Genotype_Comparison)) %>% 
+  mutate(across(c(`Q2.5`, `Q97.5`, Estimate), ~100*(exp(.x)-1)))
+
+ggplot(fe3_3tc5kND_fixed_genotype, aes(x=Estimate, y=Genotype_Comparison)) +
+  geom_point() +
+  geom_errorbar(aes(xmin=`Q2.5`, xmax=`Q97.5`), height = 0.1, orientation = "y") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  facet_wrap(~PK_Parameter, ncol=1, scales="free_y") +
+  labs(y="", x = "Difference (%)")
+```
+
+
+##### Plot genotype difs: epred sub
+
+```{r}
+fit <- fit_3tc5kND_fixed
+# Create subject-level prediction data
+# Note: Using 'sub' instead of 'ID', 'region' instead of 'Region', 'pet' instead of 'ID:Region'
+modelmat_sub <- fit$data %>% 
+  as_tibble() %>% 
+  mutate(region = NA,
+         `pet:region` = NA) %>% 
+  group_by(sub) %>% 
+  dplyr::slice(1) %>% 
+  ungroup()
+
+# Extract logBPnd at subject level
+BPp_sub_epred <- posterior_epred(fit, 
+                                   newdata = modelmat_sub %>% as.data.frame(), 
+                                   re_formula = ~ (1|sub), 
+                                   nlpar = "logBPp") %>% 
+  as_tibble() %>%
+  gather(sub_n, logBPp) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logBPp_mean = mean(logBPp),
+            logBPp_q2.5 = quantile(logBPp, 0.025),
+            logBPp_q97.5 = quantile(logBPp, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logk5 at subject level
+k5_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logk5") %>% 
+  as_tibble() %>%
+  gather(sub_n, logk5) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logk5_mean = mean(logk5),
+            logk5_q2.5 = quantile(logk5, 0.025),
+            logk5_q97.5 = quantile(logk5, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logVnd at subject level
+Vnd_sub_epred <- posterior_epred(fit, 
+                                  newdata = modelmat_sub %>% as.data.frame(), 
+                                  re_formula = ~ (1|sub), 
+                                  nlpar = "logVnd") %>% 
+  as_tibble() %>%
+  gather(sub_n, logVnd) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logVnd_mean = mean(logVnd),
+            logVnd_q2.5 = quantile(logVnd, 0.025),
+            logVnd_q97.5 = quantile(logVnd, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logk4 at subject level
+k4_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logk4") %>% 
+  as_tibble() %>%
+  gather(sub_n, logk4) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logk4_mean = mean(logk4),
+            logk4_q2.5 = quantile(logk4, 0.025),
+            logk4_q97.5 = quantile(logk4, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logK1 at subject level
+K1_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logK1") %>% 
+  as_tibble() %>%
+  gather(sub_n, logK1) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logK1_mean = mean(logK1),
+            logK1_q2.5 = quantile(logK1, 0.025),
+            logK1_q97.5 = quantile(logK1, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Plotting
+ggplot(Vnd_sub_epred, aes(x = genotype, y = exp(logVnd_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Vnd", title = "Subject-level Vnd by Genotype")
+
+ggplot(BPp_sub_epred, aes(x = genotype, y = exp(logBPp_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "BPp", title = "Subject-level BPp by Genotype")
+
+ggplot(k5_sub_epred, aes(x = genotype, y = exp(logk5_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k5", title = "Subject-level k5 by Genotype")
+
+ggplot(k4_sub_epred, aes(x = genotype, y = exp(logk4_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "Subject-level k4 by Genotype")
+
+ggplot(K1_sub_epred, aes(x = genotype, y = exp(logK1_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "K1", title = "Subject-level K1 by Genotype")
+
+
+# Combine all subject-level estimates
+sub_params_epred <- BPp_sub_epred %>% 
+  select(sub, genotype, starts_with("logBPp")) %>% 
+  left_join(k5_sub_epred %>% select(sub, starts_with("logk5"))) %>% 
+  left_join(Vnd_sub_epred %>% select(sub, starts_with("logVnd"))) %>% 
+  left_join(k4_sub_epred %>% select(sub, starts_with("logk4"))) %>% 
+  left_join(K1_sub_epred %>% select(sub, starts_with("logK1")))
+
+#write_csv(sub_params_epred, "../DerivedData/sub_params_epred_fit_3tc5kND_fixed.csv")
+```
+
+
+##### Plot genotype difs: epred PET
+
+Here we have to average across regions because the pet effects are in pet:region
+
+```{r}
+fit <- fit_3tc5kND_fixed
+# Create PET x Region prediction data (keeping region information)
+modelmat_pet_region <- fit$data %>% 
+  as_tibble() %>% 
+  group_by(pet, region) %>% 
+  dplyr::slice(1) %>% 
+  ungroup() %>% 
+  mutate(row_n = 1:n())
+
+# Helper function to extract PET-level estimates (averaging over regions)
+extract_pet_param <- function(fit, newdata, re_formula, nlpar, param_name) {
+  
+  posterior_epred(fit, 
+                  newdata = newdata %>% as.data.frame(), 
+                  re_formula = re_formula, 
+                  nlpar = nlpar) %>% 
+    as_tibble() %>%
+    mutate(sample_n = 1:n()) %>% 
+    pivot_longer(-sample_n, names_to = "row_n", values_to = "value") %>% 
+    mutate(row_n = as.numeric(str_remove(row_n, "V"))) %>% 
+    left_join(newdata %>% 
+                select(row_n, pet, sub, region, genotype, Age_dec_c), 
+              by = "row_n") %>% 
+    # Average across regions within each PET and posterior sample
+    group_by(sample_n, pet, sub, genotype, Age_dec_c) %>% 
+    summarise(value = mean(value), .groups = "drop") %>% 
+    # Summarise across posterior samples
+    group_by(pet, sub, genotype, Age_dec_c) %>% 
+    summarise("{param_name}_mean" := mean(value),
+              "{param_name}_q2.5" := quantile(value, 0.025),
+              "{param_name}_q97.5" := quantile(value, 0.975),
+              .groups = "drop") %>% 
+    mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+}
+
+# Extract all parameters
+BPp_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                     re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                     nlpar = "logBPp", param_name = "logBPp")
+
+k5_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                   nlpar = "logk5", param_name = "logk5")
+
+Vnd_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                    re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                    nlpar = "logVnd", param_name = "logVnd")
+
+k4_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                   nlpar = "logk4", param_name = "logk4")
+
+K1_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|pet:region),
+                                   nlpar = "logK1", param_name = "logK1")
+
+Vb_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet),
+                                   nlpar = "logvB", param_name = "logvB")
+
+# Plotting with lines connecting repeated measurements within subjects
+ggplot(Vnd_pet_epred, aes(x = genotype, y = exp(logVnd_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Vnd", title = "PET-level Vnd by Genotype")
+
+ggplot(BPp_pet_epred, aes(x = genotype, y = exp(logBPp_mean))) +
+  geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "BPp", title = "PET-level BPp by Genotype")
+
+ggplot(k5_pet_epred, aes(x = genotype, y = exp(logk5_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k5", title = "PET-level k5 by Genotype")
+
+ggplot(k4_pet_epred, aes(x = genotype, y = exp(logk4_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "PET-level k4 by Genotype")
+
+ggplot(K1_pet_epred, aes(x = genotype, y = exp(logK1_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "K1", title = "PET-level K1 by Genotype")
+
+# Combine all PET-level estimates
+pet_params_epred <- BPp_pet_epred %>% 
+  select(pet, sub, genotype, starts_with("logBPp")) %>% 
+  left_join(k5_pet_epred %>% select(pet, starts_with("logk5"))) %>% 
+  left_join(Vnd_pet_epred %>% select(pet, starts_with("logVnd"))) %>% 
+  left_join(k4_pet_epred %>% select(pet, starts_with("logk4"))) %>% 
+  left_join(K1_pet_epred %>% select(pet, starts_with("logK1")))
+
+# write_csv(pet_params_epred, "../DerivedData/pet_params_epred_fit3_1k.csv")
+```
+
+
+```{r, fig.width=8, fig.height=12}
+# Identify subjects with repeated measurements
+repeated_subs <- pet_params_epred %>% 
+  count(sub) %>% 
+  filter(n > 1) %>% 
+  pull(sub)
+
+# Create PET order (1, 2) for repeated subjects
+pet_params_repeated <- pet_params_epred %>% 
+  filter(sub %in% repeated_subs) %>% 
+  arrange(sub, pet) %>% 
+  group_by(sub) %>% 
+  mutate(
+    scan_num = row_number(),
+    pair = ceiling(scan_num / 2),           # pair 1 = scans 1&2, pair 2 = scans 3&4
+    pet_num = case_when(
+      scan_num %% 2 == 1 ~ "pre",           # odd scans = pre
+      scan_num %% 2 == 0 ~ "post"           # even scans = post
+    ),
+    # Create a unique subject ID per pair so lines connect within pairs
+    sub_pair = ifelse(pair == 1, sub, paste0(sub, "_pair", pair))
+  ) %>%
+  filter(!is.na(pet_num)) %>%               # drops unpaired 5th scan if present
+  ungroup()
+
+pet_params_repeated_long <- pet_params_repeated %>% 
+  pivot_longer(
+    cols = ends_with("_mean"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>% 
+  mutate(parameter = str_remove(parameter, "_mean"),
+         parameter = str_remove(parameter, "log"),
+         group = pet_num) %>% 
+  select(pet, sub, sub_pair, genotype, parameter, value, group)
+
+# Reshape to long format for faceting
+pet_params_long <- pet_params_epred %>% 
+  pivot_longer(
+    cols = ends_with("_mean"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>% 
+  mutate(parameter = str_remove(parameter, "_mean"),
+         parameter = str_remove(parameter, "log"),
+         group = "All PETs",
+         sub_pair = sub) %>% 
+  select(pet, sub, sub_pair, genotype, parameter, value, group)
+
+# Combine for plotting
+plot_data <- bind_rows(pet_params_long, pet_params_repeated_long) %>% 
+  mutate(group = factor(group, levels = c("All PETs", "pre", "post")),
+         parameter = factor(parameter, levels = c("K1", "Vnd", "BPp", "k4", "k5"))) %>% 
+  filter()
+
+library(ggh4x)
+
+plot <- ggplot(plot_data %>% 
+         filter(sub != "C32"), aes(x = group, y = exp(value))) +
+ geom_line(data = plot_data %>% 
+              filter(sub != "C32") %>%
+              filter(group != "All PETs") %>%
+              select(sub, sub_pair, genotype, parameter, value, group) %>%
+              summarise(value = mean(value),
+                        .by = c(sub, sub_pair, genotype, parameter, group)) %>%
+              pivot_wider(names_from = group, values_from = value) %>%
+              filter(!is.na(pre), !is.na(post)) %>%
+              pivot_longer(cols = c(pre, post), names_to = "group", values_to = "value") %>%
+              mutate(group = factor(group, levels = c("All PETs", "pre", "post"))),
+          aes(group = sub_pair), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 2, size = 1.5) +
+  scale_y_log10() +
+  facet_grid2(parameter ~ genotype, scales = "free", independent = "x") +
+  labs(x = NULL, y = "Parameter value (natural scale)", 
+       title = "All PETs vs pre/post-LPS by genotype") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot
+ggsave("3tc5kND_prepostLPS.pdf", plot = plot, width = 10, height = 7, dpi = 300)
+```
+
+
+##### Predict
+
+```{r}
+job::job({
+  priorfit <- brm(
+    simba_fit_formula_3tc5kND_fixed,
+    family=gaussian(),
+    data = simba_modeldata,
+    prior = simba_prior_threetc5k_fixed,
+    stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+               block="functions"),
+    backend = "rstan", init = 0, iter = 100,
+    chains=2, cores=2, seed = 753273, sample_prior = "only")
+
+brms::expose_functions(priorfit, vectorize=TRUE, verbose = F,
+                       show_compiler_warnings = F)
+  
+  preds <- predict(fit_3tc5kND_fixed)
+  fitted <- fitted(fit_3tc5kND_fixed)
+  looic <- loo(fit_3tc5kND_fixed)
+
+  saveRDS(preds, "../DerivedData/3tc5kND_preds_fixed.rds")
+  saveRDS(fitted, "../DerivedData/3tc5kND_fitted_fixed.rds")
+  saveRDS(looic, "../DerivedData/3tc5kND_looic_fixed.rds")
+})
+```
+
+```{r}
+preds <- readRDS("../DerivedData/3tc5kND_preds_fixed.rds")
+fitted <- readRDS("../DerivedData/3tc5kND_fitted_fixed.rds")
+#ps_loo <- readRDS("../DerivedData/fit4_loo.rds")
+
+simba_modeldata$P_L95 <- preds[,3]
+simba_modeldata$P_U95 <- preds[,4]
+simba_modeldata$F_L95 <- fitted[,3]
+simba_modeldata$F_U95 <- fitted[,4]
+simba_modeldata$Estimate <- fitted[,1]
+```
+
+```{r, fig.height=7, fig.width=8}
+library(ggsci)
+
+check_some_fits <- function(modeldat, sampleid) {
+
+    checkdat <- modeldat %>%
+        filter(pet == sampleid)
+
+    ggplot(checkdat, aes(x=frame_mid, y=TAC, colour=region, fill=region)) +
+        geom_point(colour="black", size=2) +
+        geom_point(size=1.5) +
+        geom_ribbon(aes(ymin=P_L95, ymax=P_U95), alpha=0.2, colour=NA) +
+        geom_ribbon(aes(ymin=F_L95, ymax=F_U95), alpha=0.4, colour=NA) +
+        geom_line(aes(y=Estimate)) +
+        facet_wrap(~region, scales="free", ncol=3) +
+        scale_colour_manual(values=pal_futurama()(12)) +
+        scale_fill_manual(values=pal_futurama(alpha = 0.3)(12)) +
+        labs(y=expression(paste("Radioactivity (kBq/cc)", sep="")),
+             x="Time (min)",
+             title = paste(sampleid, ":", checkdat$genotype[1],":",checkdat$LPS[1],":",checkdat$LPSpair[1]))
+
+}
+
+ids <- unique(simba_modeldata$pet) #sample(unique(simba_modeldata$pet), 5)
+
+map(ids, ~check_some_fits(simba_modeldata, .x))
+```
+
+### 5.3 S 
+
+#### 5.3.1 NLS
+
+##### Function
+
+```{r}
+Model_FengConv_3TC5kS <- function(time, t0, A, B, C, alpha, beta, gamma, ti, 
+                               bloodval, 
+                               logK1, logVnd, logBPp, logk4,logk5, logvB) {
+  
+  
+  K1 = exp(logK1)
+  Vnd = exp(logVnd)
+  BPp = exp(logBPp)
+  k4 = exp(logk4)
+  k5 = exp(logk5)
+  vB = exp(logvB)
+  
+  k2 = (K1 - k5 * BPp) / Vnd
+  k3 = BPp * (k4 + k5)/ Vnd
+  
+  th1 <- ((k2 + k3 + k4 + k5) + sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 *k5))) / 2
+
+  th2 <- ((k2 + k3 + k4 + k5) - sqrt((k2 + k3 + k4 + k5)^2 - 4 * (k2 * k4 + k2 * k5 + k3 *k5))) / 2
+  
+  ph1 <- (K1 * (k3 + k4 + k5 - th1) - th2 * K1 * k5 / (k2 + k5))/(th2 - th1)
+  
+  ph2 <- (K1 * (th2 - k3 - k4 - k5) - th1 * K1 * k5 / (k2 + k5))/(th2 - th1)
+  
+  ph3 <- K1 * k3 * k5/ (k2*k4 + k2*k5 + k3*k5)
+  
+  tcorr <- time - t0
+  
+  # 2TC contribution
+  (1-vB) * (
+    (tcorr > 0) * (             # Before t0 equal to 0
+      
+      # Before t0+ti
+      (tcorr < ti)*(1/ti)*(     
+        Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3)
+      ) +
+        
+      # After t0+ti 
+      (tcorr >= ti)*(1/ti)* (   
+        Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3) -
+          Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3)
+      )
+    )
+  ) +
+  # Blood contribution
+  vB*bloodval
+  
+}
+```
+
+
+##### Fitting
+
+```{r, eval=FALSE}
+plan(multisession, workers = 3) # Run this in parallel across 6 cores.
+
+modeldat_nested <- simba_modeldata %>% 
+  group_by(pet, region) %>% 
+  nest() %>%  
+  ungroup() %>% # We need to ungroup before running the parallel functions with future_map
+    mutate(fit = future_map(data, ~nls.multstart::nls_multstart(
+      TAC ~ Model_FengConv_3TC5kS(frame_mid, t0, A, B, C, alpha, beta, gamma, ti,  #t_tac, t0
+                               meanblood, 
+                               logK1, logVnd, logBPp, logk4, logk5, logvB), data = .x,
+      start_lower = c(logK1=-3.5, logVnd=-3, logBPp=0, logk4=-9, logk5=-9, logvB=-3.5),
+      start_upper = c(logK1=0, logVnd=0.5, logBPp=6, logk4=-1, logk5=-1, logvB=-2.5),
+      lower = c(logK1=-3.5, logVnd=-3, logBPp=-2, logk4=-9, logk5=-9, logvB=-3.5),
+      upper = c(logK1=0, logVnd=0.5, logBPp=6, logk4=-1, logk5=-1, logvB=-2.5),
+      modelweights = weights, iter=20, supp_errors = "Y")))
+
+
+saveRDS(modeldat_nested, "../DerivedData/nlsfitsS.rds")
+```
+
+counting the param values for all genotypes together:
+
+```{r}
+modeldat_pars <- readRDS("../DerivedData/nlsfitsS.rds") %>% 
+  mutate(par = map(fit, ~as.data.frame(as.list(coef(.x))))) %>% 
+  unnest(data) %>%
+  select(pet, region, par,genotype) %>% 
+  unnest(par)
+
+nls <- modeldat_pars %>%
+  gather(Parameter, Value, -pet, -region, -genotype) %>% 
+  ggplot(aes(x=Value, fill=Parameter)) + 
+  geom_histogram(colour="black") +
+  facet_wrap(~Parameter, scales="free")
+
+ggsave("nls3tc5kS.pdf", plot = nls, width = 10, height = 7, dpi = 300)
+```
+
+counting param values for each genotype separately:
+
+```{r}
+nls <- modeldat_pars %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB"))) %>% 
+  pivot_longer(
+    cols = -c(pet, region, genotype),
+    names_to = "Parameter",
+    values_to = "Value"
+  ) %>% 
+  ggplot(aes(x = Value, fill=Parameter)) + 
+  geom_histogram(colour = "black") +
+  facet_grid(genotype ~ Parameter, scales = "free")
+
+ggsave("nlsgenotype3tc5kS.pdf", plot = nls, width = 10, height = 7, dpi = 300)
+
+```
+
+```{r}
+plotdat <- readRDS("../DerivedData/nlsfitsS.rds") %>%
+  slice(sample(1:nrow(.), size = 20)) 
+
+pmap(list(plotdat$pet, plotdat$region, plotdat$data, plotdat$fit),
+     plot_fit)
+  
+```
+
+#### 5.4.2 One TAC Bayesian
+
+```{r, eval=TRUE}
+set.seed(1337)
+
+threetc5kS_prior <- c(
+  set_prior("normal(-2, 0.5)", nlpar = "logK1"),
+  set_prior("normal(-0.3, 0.5)", nlpar = "logVnd"),
+  set_prior("normal(0.7, 0.5)", nlpar = "logBPnd"),
+  set_prior("normal(-3, 0.5)", nlpar = "logk4"),
+  set_prior("normal(-4, 1)", nlpar = "logk5"),
+  set_prior("normal(-3, 0.25)", nlpar = "logvB"),
+  
+  set_prior("normal(0, 1)", dpar = "sigma", coef="sqrtinvw"))
+
+
+threetc5kS_fit_formula <- bf( TAC ~ threetc5kS_log_stan(logK1, logVnd, logBPnd, logk4,
+                                                  logk5, logvB, 
+                                                  frame_mid, 
+                                    t0, 
+                                    A, B, C, 
+                                    alpha, beta, gamma, 
+                                    ti, meanblood),
+     sigma ~ 0 + sqrtinvw,
+     # Nonlinear variables
+     logK1 + logVnd + logBPnd + logk4 + logk5 + logvB ~ 1,
+     # Nonlinear fit
+     nl = TRUE)
+
+get_prior(threetc5kS_fit_formula, data=dat_i, family = gaussian())
+
+make_stancode(threetc5kS_fit_formula,
+  family=gaussian(), 
+  data = dat_i,
+  prior = threetc5kS_prior,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan, 
+                     block="functions"))
+
+
+# get_prior(twotcm1k_fit_formula,
+#   family=gaussian(), 
+#   data = modeldat)
+
+
+    
+threetc5kS_fit <- brm(
+  threetc5kS_fit_formula,
+  family=gaussian(),
+  data = dat_i,
+  prior = threetc5kS_prior,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+             block="functions"),
+  control = list(adapt_delta=0.90),
+  chains = 2,
+  cores = 2,
+  iter = 1000,
+  backend = "rstan", init = 0)
+
+  
+
+#summary(threetc5kS_fit)
+
+
+```
+
+
+```{r, message=FALSE, warning=FALSE, results="hide", eval=TRUE}
+brms::expose_functions(threetc5kS_fit, vectorize=TRUE, verbose = F, 
+                       show_compiler_warnings = F)
+```
+
+```{r, eval=TRUE}
+pred <- predict(threetc5kS_fit) %>% 
+  as_tibble() %>% 
+  select(P_L95 = "Q2.5",
+         P_U95 = "Q97.5")
+
+fitted <- fitted(threetc5kS_fit) %>% 
+  as_tibble() %>% 
+  select(Estimate, 
+         F_L95 = "Q2.5",
+         F_U95 = "Q97.5")
+
+dat_i_fitted <- dat_i %>% 
+  bind_cols(pred) %>% 
+  bind_cols(fitted)
+
+ggplot(dat_i_fitted, aes(x=frame_mid, y=TAC)) +
+  geom_point() +
+  geom_ribbon(aes(ymin=P_L95, ymax=P_U95), alpha=0.1) +
+  geom_ribbon(aes(ymin=F_L95, ymax=F_U95), alpha=0.2) +
+  geom_line(aes(y=Estimate)) 
+
+
+```
+
+#### 5.3.3 Fixed genotype levels
+
+##### Prep
+
+```{r}
+simba_fit_formula_3tc5kS_fixed <- bf( TAC ~ threetc5kS_log_stan_BPp(logK1, logVnd, logBPp, logk4,
+                                                  logk5, logvB, 
+                                                  frame_mid, 
+                                    t0, 
+                                    A, B, C, 
+                                    alpha, beta, gamma, 
+                                    ti, meanblood),
+                              lf(sigma ~ 1 + s(frame_mid) + logRegSize_c + 
+                                   logInjRad_c + logdur_c +
+                                 (1 | region) + (1 | pet), center = FALSE),
+                              # Nonlinear variables
+# univariate with LPS
+                              logK1 ~ 1 + region + Age_dec_c + (1|sub) + LPS +
+                                  (1|pet:region),
+                              logBPp ~  1 + region + Age_dec_c + genotype + LPS +
+                                         (1|sub) + (1|pet:region),
+                              logVnd ~ 1 + Age_dec_c + (1|region) + (1|sub) +
+                                (1|pet:region),
+                              logk4 ~ 1 + genotype + (1|region) + (1|sub) + 
+                                (1|pet:region),
+                              logk5 ~ 1 + genotype + Age_dec_c + (1|sub) + LPS +
+                              (1|region) + (1|pet:region),
+                              logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+                              # Nonlinear fit
+                              nl = TRUE, center = TRUE)
+  
+
+sc <- make_stancode(simba_fit_formula_3tc5kS_fixed,
+  family=gaussian(),
+  data = simba_modeldata,
+  prior = simba_prior_threetc5k_fixed,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+                     block="functions"))
+
+# writeLines(sc, "stancode_unmod_LL_2.stan")
+
+stand <- brms::make_standata(simba_fit_formula_3tc5kS_fixed, 
+                          data = simba_modeldata, 
+                          family=gaussian(), 
+                          prior = simba_prior_threetc5k_fixed)
+
+stand_list <- list()
+for (t in names(stand)) {
+  stand_list[[t]] <- stand[[t]]
+}
+```
+
+##### Fit
+
+```{r}
+rm(fit_3tc5kS_fixed)
+job::job({
+  fit_3tc5kS_fixed <- brm(
+    simba_fit_formula_3tc5kS_fixed,
+    family=gaussian(), 
+    data = simba_modeldata,
+    prior = simba_prior_threetc5k_fixed,
+    stanvars = stanvar(scode = three_compartment_5k_fengconv_stan, 
+               block="functions"),
+    backend = "cmdstanr", init = 0, iter = 1000, warmup = 300,
+    chains=2, cores=2, threads = threading(6), seed =  765)
+  
+  saveRDS(fit_3tc5kS_fixed, "../DerivedData/3tc5kS_fit_fixed.rds")
+})
+```
+
+```{r}
+fit_3tc5kS_fixed <- readRDS("../DerivedData/3tc5kS_fit_fixed.rds")
+print(summary(fit_3tc5kS_fixed, digits=3))
+```
+
+##### Plot genotype difs
+
+```{r, fig.height=6, fig.width=6}
+fit <- fit_3tc5kS_fixed
+fe3_3tc5kS_fixed_genotype <- fixef(fit) %>% 
+  as_tibble(rownames="Parameter") %>% 
+  filter(str_detect(Parameter, "genotype")) %>% 
+  mutate(PK_Parameter = str_match(Parameter, "log(\\w*)_")[,2]) %>% 
+  mutate(Genotype_Comparison = str_match(Parameter, "_genotype(\\w*)")[,2],
+         Genotype_Comparison = paste0("HAB - ", Genotype_Comparison)) %>% 
+  mutate(across(c(`Q2.5`, `Q97.5`, Estimate), ~100*(exp(.x)-1)))
+
+ggplot(fe3_3tc5kS_fixed_genotype, aes(x=Estimate, y=Genotype_Comparison)) +
+  geom_point() +
+  geom_errorbar(aes(xmin=`Q2.5`, xmax=`Q97.5`), height = 0.1, orientation = "y") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  facet_wrap(~PK_Parameter, ncol=1, scales="free_y") +
+  labs(y="", x = "Difference (%)")
+  
+```
+
+##### Plot genotype difs: epred sub
+
+```{r}
+fit <- fit_3tc5kS_fixed
+# Create subject-level prediction data
+# Note: Using 'sub' instead of 'ID', 'region' instead of 'Region', 'pet' instead of 'ID:Region'
+modelmat_sub <- fit$data %>% 
+  as_tibble() %>% 
+  mutate(region = NA,
+         `pet:region` = NA) %>% 
+  group_by(sub) %>% 
+  dplyr::slice(1) %>% 
+  ungroup()
+
+# Extract logBPnd at subject level
+BPnd_sub_epred <- posterior_epred(fit, 
+                                   newdata = modelmat_sub %>% as.data.frame(), 
+                                   re_formula = ~ (1|sub), 
+                                   nlpar = "logBPnd") %>% 
+  as_tibble() %>%
+  gather(sub_n, logBPnd) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logBPnd_mean = mean(logBPnd),
+            logBPnd_q2.5 = quantile(logBPnd, 0.025),
+            logBPnd_q97.5 = quantile(logBPnd, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logk5 at subject level
+k5_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logk5") %>% 
+  as_tibble() %>%
+  gather(sub_n, logk5) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logk5_mean = mean(logk5),
+            logk5_q2.5 = quantile(logk5, 0.025),
+            logk5_q97.5 = quantile(logk5, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logVnd at subject level
+Vnd_sub_epred <- posterior_epred(fit, 
+                                  newdata = modelmat_sub %>% as.data.frame(), 
+                                  re_formula = ~ (1|sub), 
+                                  nlpar = "logVnd") %>% 
+  as_tibble() %>%
+  gather(sub_n, logVnd) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logVnd_mean = mean(logVnd),
+            logVnd_q2.5 = quantile(logVnd, 0.025),
+            logVnd_q97.5 = quantile(logVnd, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logk4 at subject level
+k4_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logk4") %>% 
+  as_tibble() %>%
+  gather(sub_n, logk4) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logk4_mean = mean(logk4),
+            logk4_q2.5 = quantile(logk4, 0.025),
+            logk4_q97.5 = quantile(logk4, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logK1 at subject level
+K1_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logK1") %>% 
+  as_tibble() %>%
+  gather(sub_n, logK1) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logK1_mean = mean(logK1),
+            logK1_q2.5 = quantile(logK1, 0.025),
+            logK1_q97.5 = quantile(logK1, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Plotting
+ggplot(Vnd_sub_epred, aes(x = genotype, y = exp(logVnd_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Vnd", title = "Subject-level Vnd by Genotype")
+
+ggplot(BPnd_sub_epred, aes(x = genotype, y = exp(logBPnd_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "BPnd", title = "Subject-level BPnd by Genotype")
+
+ggplot(k5_sub_epred, aes(x = genotype, y = exp(logk5_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Kb", title = "Subject-level k5 by Genotype")
+
+ggplot(k4_sub_epred, aes(x = genotype, y = exp(logk4_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "Subject-level k4 by Genotype")
+
+ggplot(K1_sub_epred, aes(x = genotype, y = exp(logK1_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "K1", title = "Subject-level K1 by Genotype")
+
+
+# Combine all subject-level estimates
+sub_params_epred <- BPnd_sub_epred %>% 
+  select(sub, genotype, starts_with("logBPnd")) %>% 
+  left_join(k5_sub_epred %>% select(sub, starts_with("logk5"))) %>% 
+  left_join(Vnd_sub_epred %>% select(sub, starts_with("logVnd"))) %>% 
+  left_join(k4_sub_epred %>% select(sub, starts_with("logk4"))) %>% 
+  left_join(K1_sub_epred %>% select(sub, starts_with("logK1")))
+
+write_csv(sub_params_epred, "../DerivedData/sub_params_epred_fit_3tc5kS_fixed.csv")
+```
+
+##### Plot genotype difs: epred PET
+
+Here we have to average across regions because the pet effects are in pet:region
+
+```{r}
+fit <- fit_3tc5kS_fixed
+# Create PET x Region prediction data (keeping region information)
+modelmat_pet_region <- fit$data %>% 
+  as_tibble() %>% 
+  group_by(pet, region) %>% 
+  dplyr::slice(1) %>% 
+  ungroup() %>% 
+  mutate(row_n = 1:n())
+
+# Helper function to extract PET-level estimates (averaging over regions)
+extract_pet_param <- function(fit, newdata, re_formula, nlpar, param_name) {
+  
+  posterior_epred(fit, 
+                  newdata = newdata %>% as.data.frame(), 
+                  re_formula = re_formula, 
+                  nlpar = nlpar) %>% 
+    as_tibble() %>%
+    mutate(sample_n = 1:n()) %>% 
+    pivot_longer(-sample_n, names_to = "row_n", values_to = "value") %>% 
+    mutate(row_n = as.numeric(str_remove(row_n, "V"))) %>% 
+    left_join(newdata %>% 
+                select(row_n, pet, sub, region, genotype, Age_dec_c), 
+              by = "row_n") %>% 
+    # Average across regions within each PET and posterior sample
+    group_by(sample_n, pet, sub, genotype, Age_dec_c) %>% 
+    summarise(value = mean(value), .groups = "drop") %>% 
+    # Summarise across posterior samples
+    group_by(pet, sub, genotype, Age_dec_c) %>% 
+    summarise("{param_name}_mean" := mean(value),
+              "{param_name}_q2.5" := quantile(value, 0.025),
+              "{param_name}_q97.5" := quantile(value, 0.975),
+              .groups = "drop") %>% 
+    mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+}
+
+# Extract all parameters
+BPnd_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                     re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                     nlpar = "logBPnd", param_name = "logBPnd")
+
+k5_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                   nlpar = "logk5", param_name = "logk5")
+
+Vnd_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                    re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                    nlpar = "logVnd", param_name = "logVnd")
+
+k4_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                   nlpar = "logk4", param_name = "logk4")
+
+K1_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|pet:region),
+                                   nlpar = "logK1", param_name = "logK1")
+
+Vb_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet),
+                                   nlpar = "logvB", param_name = "logvB")
+
+# Plotting with lines connecting repeated measurements within subjects
+ggplot(Vnd_pet_epred, aes(x = genotype, y = exp(logVnd_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Vnd", title = "PET-level Vnd by Genotype")
+
+ggplot(BPnd_pet_epred, aes(x = genotype, y = exp(logBPnd_mean))) +
+  geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "BPnd", title = "PET-level BPnd by Genotype")
+
+ggplot(k5_pet_epred, aes(x = genotype, y = exp(logk5_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k5", title = "PET-level k5 by Genotype")
+
+ggplot(k4_pet_epred, aes(x = genotype, y = exp(logk4_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "PET-level k4 by Genotype")
+
+ggplot(K1_pet_epred, aes(x = genotype, y = exp(logK1_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "K1", title = "PET-level K1 by Genotype")
+
+# Combine all PET-level estimates
+pet_params_epred <- BPnd_pet_epred %>% 
+  select(pet, sub, genotype, starts_with("logBPnd")) %>% 
+  left_join(k5_pet_epred %>% select(pet, starts_with("logk5"))) %>% 
+  left_join(Vnd_pet_epred %>% select(pet, starts_with("logVnd"))) %>% 
+  left_join(k4_pet_epred %>% select(pet, starts_with("logk4"))) %>% 
+  left_join(K1_pet_epred %>% select(pet, starts_with("logK1")))
+
+# write_csv(pet_params_epred, "../DerivedData/pet_params_epred_fit3_1k.csv")
+```
+
+```{r, fig.width=8, fig.height=12}
+# Identify subjects with repeated measurements
+repeated_subs <- pet_params_epred %>% 
+  count(sub) %>% 
+  filter(n > 1) %>% 
+  pull(sub)
+
+# Create PET order (1, 2) for repeated subjects
+pet_params_repeated <- pet_params_epred %>% 
+  filter(sub %in% repeated_subs) %>% 
+  arrange(sub, pet) %>% 
+  group_by(sub) %>% 
+  mutate(pet_num = paste0("PET", row_number())) %>% 
+  ungroup()
+
+# Reshape to long format for faceting
+pet_params_long <- pet_params_epred %>% 
+  pivot_longer(
+    cols = ends_with("_mean"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>% 
+  mutate(parameter = str_remove(parameter, "_mean"),
+         parameter = str_remove(parameter, "log"),
+         group = "All PETs") %>% 
+  select(pet, sub, genotype, parameter, value, group)
+
+pet_params_repeated_long <- pet_params_repeated %>% 
+  pivot_longer(
+    cols = ends_with("_mean"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>% 
+  mutate(parameter = str_remove(parameter, "_mean"),
+         parameter = str_remove(parameter, "log"),
+         group = pet_num) %>% 
+  select(pet, sub, genotype, parameter, value, group)
+
+# Combine for plotting
+plot_data <- bind_rows(pet_params_long, pet_params_repeated_long) %>% 
+  mutate(group = factor(group, levels = c("All PETs", "PET1", "PET2")),
+         parameter = factor(parameter, levels = c("K1", "Vnd", "BPnd", "k4", "k5"))) %>% 
+  filter()
+
+library(ggh4x)
+
+ggplot(plot_data %>% 
+         filter(sub != "C32"), aes(x = group, y = exp(value))) +
+  geom_line(data = plot_data %>% 
+              filter(group != "All PETs") %>%
+              select(sub, genotype, parameter, value, group) %>%
+              pivot_wider(names_from = group, values_from = value) %>%
+              pivot_longer(cols = c(PET1, PET2), names_to = "group", values_to = "value") %>%
+              mutate(group = factor(group, levels = c("All PETs", "PET1", "PET2"))),
+            aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 2, size = 1.5) +
+  scale_y_log10() +
+  facet_grid2(parameter ~ genotype, scales = "free", independent = "x") +
+  labs(x = NULL, y = "Parameter value (natural scale)", 
+       title = "All PETs vs repeated measurements by genotype") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+##### Predict
+
+```{r}
+job::job({
+  priorfit <- brm(
+    simba_fit_formula_3tc5kS_fixed,
+    family=gaussian(),
+    data = simba_modeldata_sub,
+    prior = simba_prior_threetc5k_fixed,
+    stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+               block="functions"),
+    backend = "rstan", init = 0, iter = 100,
+    chains=2, cores=5, seed = 753273, sample_prior = "only")
+
+brms::expose_functions(priorfit, vectorize=TRUE, verbose = F,
+                       show_compiler_warnings = F)
+  
+  preds <- predict(fit_3tc5kS_fixed)
+  fitted <- fitted(fit_3tc5kS_fixed)
+  looic <- loo(fit_3tc5kS_fixed)
+  
+  saveRDS(preds, "../DerivedData/fit4_preds_threetc5kS_fixed.rds")
+  saveRDS(fitted, "../DerivedData/fit4_fitted_threetc5kS_fixed.rds")
+  saveRDS(looic, "../DerivedData/fit4_looic_threetc5kS_fixed.rds")
+})
+```
+
+```{r}
+preds <- readRDS("../DerivedData/fit4_preds_threetc5kS_fixed.rds")
+fitted <- readRDS("../DerivedData/fit4_fitted_threetc5kS_fixed.rds")
+#ps_loo <- readRDS("../DerivedData/fit4_loo.rds")
+
+simba_modeldata_sub$P_L95 <- preds[,3]
+simba_modeldata_sub$P_U95 <- preds[,4]
+simba_modeldata_sub$F_L95 <- fitted[,3]
+simba_modeldata_sub$F_U95 <- fitted[,4]
+simba_modeldata_sub$Estimate <- fitted[,1]
+```
+
+```{r, fig.height=7, fig.width=8}
+library(ggsci)
+
+check_some_fits <- function(modeldat, sampleid) {
+
+    checkdat <- modeldat %>%
+        filter(pet == sampleid)
+
+    ggplot(checkdat, aes(x=frame_mid, y=TAC, colour=region, fill=region)) +
+        geom_point(colour="black", size=2) +
+        geom_point(size=1.5) +
+        geom_ribbon(aes(ymin=P_L95, ymax=P_U95), alpha=0.2, colour=NA) +
+        geom_ribbon(aes(ymin=F_L95, ymax=F_U95), alpha=0.4, colour=NA) +
+        geom_line(aes(y=Estimate)) +
+        facet_wrap(~region, scales="free", ncol=3) +
+        scale_colour_manual(values=pal_futurama()(12)) +
+        scale_fill_manual(values=pal_futurama(alpha = 0.3)(12)) +
+        labs(y=expression(paste("Radioactivity (kBq/cc)", sep="")),
+             x="Time (min)",
+             title = paste(sampleid, ":", checkdat$genotype[1]))
+
+}
+
+ids <- unique(simba_modeldata_sub$pet) #sample(unique(simba_modeldata$pet), 5)
+
+map(ids, ~check_some_fits(simba_modeldata_sub, .x))
+```
+
+### 5.4 P 
+
+#### 5.4.1 NLS
+
+##### Function
+
+```{r}
+Model_FengConv_3TC5kP <- function(time, t0, A, B, C, alpha, beta, gamma, ti, 
+                               bloodval, 
+                               logK1, logVnd, logBPnd, logk4,logk5, logvB) {
+  
+  
+  K1 = exp(logK1)
+  Vnd = exp(logVnd)
+  BPnd = exp(logBPnd)
+  k4 = exp(logk4)
+  k5 = exp(logk5)
+  vB = exp(logvB)
+  
+  k2 = K1 / Vnd
+  k3 = BPnd * k4
+  
+  th1 <- ((k2 + k3 + k4) - sqrt((k2 + k3 + k4)^2 - 4 * k2 * k4)) / 2
+
+  th2 <- ((k2 + k3 + k4) + sqrt((k2 + k3 + k4)^2 - 4 * k2 * k4)) / 2
+  
+  ph1 <- (K1 * (k3 + k4 - th1))/(th2 - th1)
+  
+  ph2 <- (K1 * (th2 - k3 - k4))/(th2 - th1)
+  
+  ph3 <- k5
+  
+  tcorr <- time - t0
+  
+  # 2TC contribution
+  (1-vB) * (
+    (tcorr > 0) * (             # Before t0 equal to 0
+      
+      # Before t0+ti
+      (tcorr < ti)*(1/ti)*(     
+        Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3)
+      ) +
+        
+      # After t0+ti 
+      (tcorr >= ti)*(1/ti)* (   
+        Integral_Feng_3TC5K(tcorr, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3) -
+          Integral_Feng_3TC5K(tcorr - ti, A, B, C, alpha, beta, gamma, 
+                         th1, th2, ph1, ph2, ph3)
+      )
+    )
+  ) +
+  # Blood contribution
+  vB*bloodval
+  
+}
+```
+
+
+##### Fitting
+
+```{r, eval=FALSE}
+plan(multisession, workers = 6) # Run this in parallel across 6 cores.
+
+modeldat_nested <- simba_modeldata %>% 
+  group_by(pet, region) %>% 
+  nest() %>%  
+  ungroup() %>% # We need to ungroup before running the parallel functions with future_map
+    mutate(fit = future_map(data, ~nls.multstart::nls_multstart(
+      TAC ~ Model_FengConv_3TC5kP(frame_mid, t0, A, B, C, alpha, beta, gamma, ti,  #t_tac, t0
+                               meanblood, 
+                               logK1, logVnd, logBPnd, logk4, logk5, logvB), data = .x,
+      start_lower = c(logK1=-3.5, logVnd=-3, logBPnd=0, logk4=-9, logk5=-9, logvB=-3.5),
+      start_upper = c(logK1=0, logVnd=0.5, logBPnd=6, logk4=-1, logk5=-1, logvB=-2.5),
+      lower = c(logK1=-3.5, logVnd=-3, logBPnd=-2, logk4=-9, logk5=-9, logvB=-3.5),
+      upper = c(logK1=0, logVnd=0.5, logBPnd=6, logk4=-1, logk5=-1, logvB=-2.5),
+      modelweights = weights, iter=20, supp_errors = "Y")))
+
+
+saveRDS(modeldat_nested, "../DerivedData/nlsfits_P.rds")
+```
+
+```{r}
+modeldat_pars <- readRDS("../DerivedData/nlsfits_P.rds") %>% 
+  mutate(par = map(fit, ~as.data.frame(as.list(coef(.x))))) %>% 
+  unnest(data) %>%
+  select(pet, region, par,genotype) %>% 
+  unnest(par)
+
+nls <- modeldat_pars %>%
+  gather(Parameter, Value, -pet, -region, -genotype) %>% 
+  ggplot(aes(x=Value, fill=Parameter)) + 
+  geom_histogram(colour="black") +
+  facet_wrap(~Parameter, scales="free")
+
+ggsave("nls3tc5kP.pdf", plot = nls, width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+nls <- modeldat_pars %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB"))) %>% 
+  pivot_longer(
+    cols = -c(pet, region, genotype),
+    names_to = "Parameter",
+    values_to = "Value"
+  ) %>% 
+  ggplot(aes(x = Value, fill=Parameter)) + 
+  geom_histogram(colour = "black") +
+  facet_grid(genotype ~ Parameter, scales = "free")
+
+ggsave("nlsgenotype3tc5kP.pdf", plot = nls, width = 10, height = 7, dpi = 300)
+
+```
+
+
+
+
+```{r}
+plotdat <- readRDS("../DerivedData/nlsfits_P.rds") %>%
+  slice(sample(1:nrow(.), size = 20)) 
+
+pmap(list(plotdat$pet, plotdat$region, plotdat$data, plotdat$fit),
+     plot_fit)
+```
+
+#### 5.4.2 One TAC Bayesian
+
+```{r, eval=TRUE}
+set.seed(1337)
+
+threetc5kP_prior <- c(
+  set_prior("normal(-2, 0.5)", nlpar = "logK1"),
+  set_prior("normal(-0.3, 0.5)", nlpar = "logVnd"),
+  set_prior("normal(0.7, 0.5)", nlpar = "logBPnd"),
+  set_prior("normal(-3, 0.5)", nlpar = "logk4"),
+  set_prior("normal(-4, 1)", nlpar = "logk5"),
+  set_prior("normal(-3, 0.25)", nlpar = "logvB"),
+  
+  set_prior("normal(0, 1)", dpar = "sigma", coef="sqrtinvw"))
+
+
+threetc5kP_fit_formula <- bf( TAC ~ threetc5kP_log_stan(logK1, logVnd, logBPnd, logk4,
+                                                  logk5, logvB, 
+                                                  frame_mid, 
+                                    t0, 
+                                    A, B, C, 
+                                    alpha, beta, gamma, 
+                                    ti, meanblood),
+     sigma ~ 0 + sqrtinvw,
+     # Nonlinear variables
+     logK1 + logVnd + logBPnd + logk4 + logk5 + logvB ~ 1,
+     # Nonlinear fit
+     nl = TRUE)
+
+get_prior(threetc5kP_fit_formula, data=dat_i, family = gaussian())
+
+make_stancode(threetc5kP_fit_formula,
+  family=gaussian(), 
+  data = dat_i,
+  prior = threetc5kP_prior,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan, 
+                     block="functions"))
+
+
+# get_prior(twotcm1k_fit_formula,
+#   family=gaussian(), 
+#   data = modeldat)
+
+
+    
+threetc5kP_fit <- brm(
+  threetc5kP_fit_formula,
+  family=gaussian(),
+  data = dat_i,
+  prior = threetc5kP_prior,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+             block="functions"),
+  control = list(adapt_delta=0.90),
+  chains = 2,
+  cores = 2,
+  iter = 1000,
+  backend = "rstan", init = 0)
+
+  
+
+summary(threetc5kP_fit)
+
+
+```
+
+
+```{r, message=FALSE, warning=FALSE, results="hide", eval=TRUE}
+brms::expose_functions(threetc5kP_fit, vectorize=TRUE, verbose = F, 
+                       show_compiler_warnings = F)
+```
+
+```{r, eval=TRUE}
+pred <- predict(threetc5kP_fit) %>% 
+  as_tibble() %>% 
+  select(P_L95 = "Q2.5",
+         P_U95 = "Q97.5")
+
+fitted <- fitted(threetc5kP_fit) %>% 
+  as_tibble() %>% 
+  select(Estimate, 
+         F_L95 = "Q2.5",
+         F_U95 = "Q97.5")
+
+dat_i_fitted <- dat_i %>% 
+  bind_cols(pred) %>% 
+  bind_cols(fitted)
+
+ggplot(dat_i_fitted, aes(x=frame_mid, y=TAC)) +
+  geom_point() +
+  geom_ribbon(aes(ymin=P_L95, ymax=P_U95), alpha=0.1) +
+  geom_ribbon(aes(ymin=F_L95, ymax=F_U95), alpha=0.2) +
+  geom_line(aes(y=Estimate)) 
+
+
+```
+
+#### 5.4.3 Fixed genotype levels
+
+##### Prep
+
+```{r}
+simba_fit_formula_3tc5kP_fixed <- bf( TAC ~ threetc5kP_log_stan(logK1, logVnd, logBPnd, logk4,
+                                                  logk5, logvB, 
+                                                  frame_mid, 
+                                    t0, 
+                                    A, B, C, 
+                                    alpha, beta, gamma, 
+                                    ti, meanblood),
+                              lf(sigma ~ 1 + s(frame_mid) + logRegSize_c + 
+                                   logInjRad_c + logdur_c +
+                                 (1 | region) + (1 | pet), center = FALSE),
+                              # Nonlinear variables
+# univariate with LPS
+                              logK1 ~ 1 + region + Age_dec_c + (1|sub) + LPS +
+                                  (1|pet:region),
+                              logBPp ~  1 + region + Age_dec_c + genotype + LPS +
+                                         (1|sub) + (1|pet:region),
+                              logVnd ~ 1 + Age_dec_c + (1|region) + (1|sub) +
+                                (1|pet:region),
+                              logk4 ~ 1 + genotype + (1|region) + (1|sub) + 
+                                (1|pet:region),
+                              logk5 ~ 1 + genotype + Age_dec_c + (1|sub) + LPS +
+                              (1|region) + (1|pet:region),
+                              logvB ~ 1 + (1|sub) + (1|region) + (1|pet),
+                              # Nonlinear fit
+                              nl = TRUE, center = TRUE)
+  
+
+sc <- make_stancode(simba_fit_formula_3tc5kP_fixed,
+  family=gaussian(),
+  data = simba_modeldata,
+  prior = simba_prior_threetc5k_fixed,
+  stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+                     block="functions"))
+
+# writeLines(sc, "stancode_unmod_LL_2.stan")
+
+stand <- brms::make_standata(simba_fit_formula_3tc5kP_fixed, 
+                          data = simba_modeldata, 
+                          family=gaussian(), 
+                          prior = simba_prior_threetc5k_fixed)
+
+stand_list <- list()
+for (t in names(stand)) {
+  stand_list[[t]] <- stand[[t]]
+}
+```
+
+##### Fit
+
+```{r}
+rm(fit_3tc5kP_fixed)
+job::job({
+  fit_3tc5kP_fixed <- brm(
+    simba_fit_formula_3tc5kP_fixed,
+    family=gaussian(), 
+    data = simba_modeldata,
+    prior = simba_prior_threetc5k_fixed,
+    stanvars = stanvar(scode = three_compartment_5k_fengconv_stan, 
+               block="functions"),
+    backend = "cmdstanr", init = 0, iter = 1000, warmup = 300,
+    chains=2, cores=2, threads = threading(5), seed =  765)
+  
+  saveRDS(fit_3tc5kP_fixed, "../DerivedData/pbr_3tc5kP_fit_fixed.rds")
+})
+```
+
+```{r}
+fit_3tc5kP_fixed <- readRDS("../DerivedData/pbr_3tc5kP_fit_fixed.rds")
+print(summary(fit_3tc5kP_fixed, digits=3))
+```
+
+##### Plot genotype difs
+
+```{r, fig.height=6, fig.width=6}
+fit <- fit_3tc5kP_fixed
+fe3_3tc5kP_fixed_genotype <- fixef(fit) %>% 
+  as_tibble(rownames="Parameter") %>% 
+  filter(str_detect(Parameter, "genotype")) %>% 
+  mutate(PK_Parameter = str_match(Parameter, "log(\\w*)_")[,2]) %>% 
+  mutate(Genotype_Comparison = str_match(Parameter, "_genotype(\\w*)")[,2],
+         Genotype_Comparison = paste0("HAB - ", Genotype_Comparison)) %>% 
+  mutate(across(c(`Q2.5`, `Q97.5`, Estimate), ~100*(exp(.x)-1)))
+
+ggplot(fe3_3tc5kP_fixed_genotype, aes(x=Estimate, y=Genotype_Comparison)) +
+  geom_point() +
+  geom_errorbar(aes(xmin=`Q2.5`, xmax=`Q97.5`), height = 0.1, orientation = "y") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  facet_wrap(~PK_Parameter, ncol=1, scales="free_y") +
+  labs(y="", x = "Difference (%)")
+  
+```
+
+##### Plot genotype difs: epred sub
+
+```{r}
+fit <- fit_3tc5kP_fixed
+# Create subject-level prediction data
+# Note: Using 'sub' instead of 'ID', 'region' instead of 'Region', 'pet' instead of 'ID:Region'
+modelmat_sub <- fit$data %>% 
+  as_tibble() %>% 
+  mutate(region = NA,
+         `pet:region` = NA) %>% 
+  group_by(sub) %>% 
+  dplyr::slice(1) %>% 
+  ungroup()
+
+# Extract logBPnd at subject level
+BPnd_sub_epred <- posterior_epred(fit, 
+                                   newdata = modelmat_sub %>% as.data.frame(), 
+                                   re_formula = ~ (1|sub), 
+                                   nlpar = "logBPnd") %>% 
+  as_tibble() %>%
+  gather(sub_n, logBPnd) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logBPnd_mean = mean(logBPnd),
+            logBPnd_q2.5 = quantile(logBPnd, 0.025),
+            logBPnd_q97.5 = quantile(logBPnd, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logk5 at subject level
+k5_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logk5") %>% 
+  as_tibble() %>%
+  gather(sub_n, logk5) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logk5_mean = mean(logk5),
+            logk5_q2.5 = quantile(logk5, 0.025),
+            logk5_q97.5 = quantile(logk5, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logVnd at subject level
+Vnd_sub_epred <- posterior_epred(fit, 
+                                  newdata = modelmat_sub %>% as.data.frame(), 
+                                  re_formula = ~ (1|sub), 
+                                  nlpar = "logVnd") %>% 
+  as_tibble() %>%
+  gather(sub_n, logVnd) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logVnd_mean = mean(logVnd),
+            logVnd_q2.5 = quantile(logVnd, 0.025),
+            logVnd_q97.5 = quantile(logVnd, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logk4 at subject level
+k4_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logk4") %>% 
+  as_tibble() %>%
+  gather(sub_n, logk4) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logk4_mean = mean(logk4),
+            logk4_q2.5 = quantile(logk4, 0.025),
+            logk4_q97.5 = quantile(logk4, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Extract logK1 at subject level
+K1_sub_epred <- posterior_epred(fit, 
+                                 newdata = modelmat_sub %>% as.data.frame(), 
+                                 re_formula = ~ (1|sub), 
+                                 nlpar = "logK1") %>% 
+  as_tibble() %>%
+  gather(sub_n, logK1) %>% 
+  group_by(sub_n) %>% 
+  mutate(sample_n = 1:n()) %>% 
+  mutate(sub_n = str_remove(sub_n, "V"),
+         sub_n = as.numeric(sub_n)) %>% 
+  arrange(sub_n) %>% 
+  group_by(sub_n) %>% 
+  summarise(logK1_mean = mean(logK1),
+            logK1_q2.5 = quantile(logK1, 0.025),
+            logK1_q97.5 = quantile(logK1, 0.975)) %>% 
+  mutate(sub = modelmat_sub$sub) %>% 
+  left_join(modelmat_sub %>% select(sub, genotype, Age_dec_c)) %>% 
+  mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+
+# Plotting
+ggplot(Vnd_sub_epred, aes(x = genotype, y = exp(logVnd_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Vnd", title = "Subject-level Vnd by Genotype")
+
+ggplot(BPnd_sub_epred, aes(x = genotype, y = exp(logBPnd_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "BPnd", title = "Subject-level BPnd by Genotype")
+
+ggplot(k5_sub_epred, aes(x = genotype, y = exp(logk5_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k5", title = "Subject-level k5 by Genotype")
+
+ggplot(k4_sub_epred, aes(x = genotype, y = exp(logk4_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "Subject-level k4 by Genotype")
+
+ggplot(K1_sub_epred, aes(x = genotype, y = exp(logK1_mean))) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "Subject-level K1 by Genotype")
+
+
+# Combine all subject-level estimates
+sub_params_epred <- BPnd_sub_epred %>% 
+  select(sub, genotype, starts_with("logBPnd")) %>% 
+  left_join(k5_sub_epred %>% select(sub, starts_with("logk5"))) %>% 
+  left_join(Vnd_sub_epred %>% select(sub, starts_with("logVnd"))) %>% 
+  left_join(k4_sub_epred %>% select(sub, starts_with("logk4"))) %>% 
+  left_join(K1_sub_epred %>% select(sub, starts_with("logK1")))
+
+write_csv(sub_params_epred, "../DerivedData/sub_params_epred_fit_3tc5kP_fixed.csv")
+```
+
+##### Plot genotype difs: epred PET
+
+Here we have to average across regions because the pet effects are in pet:region
+
+```{r}
+fit <- fit_3tc5kP_fixed
+# Create PET x Region prediction data (keeping region information)
+modelmat_pet_region <- fit$data %>% 
+  as_tibble() %>% 
+  group_by(pet, region) %>% 
+  dplyr::slice(1) %>% 
+  ungroup() %>% 
+  mutate(row_n = 1:n())
+
+# Helper function to extract PET-level estimates (averaging over regions)
+extract_pet_param <- function(fit, newdata, re_formula, nlpar, param_name) {
+  
+  posterior_epred(fit, 
+                  newdata = newdata %>% as.data.frame(), 
+                  re_formula = re_formula, 
+                  nlpar = nlpar) %>% 
+    as_tibble() %>%
+    mutate(sample_n = 1:n()) %>% 
+    pivot_longer(-sample_n, names_to = "row_n", values_to = "value") %>% 
+    mutate(row_n = as.numeric(str_remove(row_n, "V"))) %>% 
+    left_join(newdata %>% 
+                select(row_n, pet, sub, region, genotype, Age_dec_c), 
+              by = "row_n") %>% 
+    # Average across regions within each PET and posterior sample
+    group_by(sample_n, pet, sub, genotype, Age_dec_c) %>% 
+    summarise(value = mean(value), .groups = "drop") %>% 
+    # Summarise across posterior samples
+    group_by(pet, sub, genotype, Age_dec_c) %>% 
+    summarise("{param_name}_mean" := mean(value),
+              "{param_name}_q2.5" := quantile(value, 0.025),
+              "{param_name}_q97.5" := quantile(value, 0.975),
+              .groups = "drop") %>% 
+    mutate(genotype = factor(genotype, levels = c("HAB", "MAB", "LAB")))
+}
+
+# Extract all parameters
+BPnd_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                     re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                     nlpar = "logBPnd", param_name = "logBPnd")
+
+k5_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                   nlpar = "logk5", param_name = "logk5")
+
+Vnd_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                    re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                    nlpar = "logVnd", param_name = "logVnd")
+
+k4_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet:region),
+                                   nlpar = "logk4", param_name = "logk4")
+
+K1_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|pet:region),
+                                   nlpar = "logK1", param_name = "logK1")
+
+Vb_pet_epred <- extract_pet_param(fit, modelmat_pet_region,
+                                   re_formula = ~ (1|sub) + (1|region) + (1|pet),
+                                   nlpar = "logvB", param_name = "logvB")
+
+# Plotting with lines connecting repeated measurements within subjects
+ggplot(Vnd_pet_epred, aes(x = genotype, y = exp(logVnd_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "Vnd", title = "PET-level Vnd by Genotype")
+
+ggplot(BPnd_pet_epred, aes(x = genotype, y = exp(logBPnd_mean))) +
+  geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "BPnd", title = "PET-level BPnd by Genotype")
+
+ggplot(k5_pet_epred, aes(x = genotype, y = exp(logk5_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k5", title = "PET-level k5 by Genotype")
+
+ggplot(k4_pet_epred, aes(x = genotype, y = exp(logk4_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "k4", title = "PET-level k4 by Genotype")
+
+ggplot(K1_pet_epred, aes(x = genotype, y = exp(logK1_mean))) +
+  # geom_line(aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 3) +
+  scale_y_log10() +
+  labs(y = "K1", title = "PET-level K1 by Genotype")
+
+# Combine all PET-level estimates
+pet_params_epred <- BPnd_pet_epred %>% 
+  select(pet, sub, genotype, starts_with("logBPnd")) %>% 
+  left_join(k5_pet_epred %>% select(pet, starts_with("logk5"))) %>% 
+  left_join(Vnd_pet_epred %>% select(pet, starts_with("logVnd"))) %>% 
+  left_join(k4_pet_epred %>% select(pet, starts_with("logk4"))) %>% 
+  left_join(K1_pet_epred %>% select(pet, starts_with("logK1")))
+
+# write_csv(pet_params_epred, "../DerivedData/pet_params_epred_fit3_1k.csv")
+```
+
+```{r, fig.width=8, fig.height=12}
+# Identify subjects with repeated measurements
+repeated_subs <- pet_params_epred %>% 
+  count(sub) %>% 
+  filter(n > 1) %>% 
+  pull(sub)
+
+# Create PET order (1, 2) for repeated subjects
+pet_params_repeated <- pet_params_epred %>% 
+  filter(sub %in% repeated_subs) %>% 
+  arrange(sub, pet) %>% 
+  group_by(sub) %>% 
+  mutate(pet_num = paste0("PET", row_number())) %>% 
+  ungroup()
+
+# Reshape to long format for faceting
+pet_params_long <- pet_params_epred %>% 
+  pivot_longer(
+    cols = ends_with("_mean"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>% 
+  mutate(parameter = str_remove(parameter, "_mean"),
+         parameter = str_remove(parameter, "log"),
+         group = "All PETs") %>% 
+  select(pet, sub, genotype, parameter, value, group)
+
+pet_params_repeated_long <- pet_params_repeated %>% 
+  pivot_longer(
+    cols = ends_with("_mean"),
+    names_to = "parameter",
+    values_to = "value"
+  ) %>% 
+  mutate(parameter = str_remove(parameter, "_mean"),
+         parameter = str_remove(parameter, "log"),
+         group = pet_num) %>% 
+  select(pet, sub, genotype, parameter, value, group)
+
+# Combine for plotting
+plot_data <- bind_rows(pet_params_long, pet_params_repeated_long) %>% 
+  mutate(group = factor(group, levels = c("All PETs", "PET1", "PET2")),
+         parameter = factor(parameter, levels = c("K1", "Vnd", "BPnd", "k4", "k5"))) %>% 
+  filter()
+
+library(ggh4x)
+
+ggplot(plot_data %>% 
+         filter(sub != "C32"), aes(x = group, y = exp(value))) +
+  geom_line(data = plot_data %>% 
+              filter(group != "All PETs") %>%
+              select(sub, genotype, parameter, value, group) %>%
+              pivot_wider(names_from = group, values_from = value) %>%
+              pivot_longer(cols = c(PET1, PET2), names_to = "group", values_to = "value") %>%
+              mutate(group = factor(group, levels = c("All PETs", "PET1", "PET2"))),
+            aes(group = sub), alpha = 0.3, linewidth = 0.5) +
+  ggbeeswarm::geom_beeswarm(cex = 2, size = 1.5) +
+  scale_y_log10() +
+  facet_grid2(parameter ~ genotype, scales = "free", independent = "x") +
+  labs(x = NULL, y = "Parameter value (natural scale)", 
+       title = "All PETs vs repeated measurements by genotype") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+##### Predict
+
+```{r}
+job::job({
+  priorfit <- brm(
+    simba_fit_formula_3tc5kP_fixed,
+    family=gaussian(),
+    data = simba_modeldata_sub,
+    prior = simba_prior_threetc5k_fixed,
+    stanvars = stanvar(scode = three_compartment_5k_fengconv_stan,
+               block="functions"),
+    backend = "rstan", init = 0, iter = 100,
+    chains=2, cores=2, seed = 753273, sample_prior = "only")
+
+brms::expose_functions(priorfit, vectorize=TRUE, verbose = F,
+                       show_compiler_warnings = F)
+  
+  preds <- predict(fit_3tc5kP_fixed)
+  fitted <- fitted(fit_3tc5kP_fixed)
+  looic <- loo(fit_3tc5kP_fixed)
+  
+  saveRDS(preds, "../DerivedData/fit4_preds_threetc5kP_fixed.rds")
+  saveRDS(fitted, "../DerivedData/fit4_fitted_threetc5kP_fixed.rds")
+  saveRDS(looic, "../DerivedData/fit4_looic_threetc5kP_fixed.rds")
+})
+```
+
+```{r}
+preds <- readRDS("../DerivedData/fit4_preds_threetc5kP_fixed.rds")
+fitted <- readRDS("../DerivedData/fit4_fitted_threetc5kP_fixed.rds")
+#ps_loo <- readRDS("../DerivedData/fit4_loo.rds")
+
+simba_modeldata_sub$P_L95 <- preds[,3]
+simba_modeldata_sub$P_U95 <- preds[,4]
+simba_modeldata_sub$F_L95 <- fitted[,3]
+simba_modeldata_sub$F_U95 <- fitted[,4]
+simba_modeldata_sub$Estimate <- fitted[,1]
+```
+
+```{r, fig.height=7, fig.width=8}
+library(ggsci)
+
+check_some_fits <- function(modeldat, sampleid) {
+
+    checkdat <- modeldat %>%
+        filter(pet == sampleid)
+
+    ggplot(checkdat, aes(x=frame_mid, y=TAC, colour=region, fill=region)) +
+        geom_point(colour="black", size=2) +
+        geom_point(size=1.5) +
+        geom_ribbon(aes(ymin=P_L95, ymax=P_U95), alpha=0.2, colour=NA) +
+        geom_ribbon(aes(ymin=F_L95, ymax=F_U95), alpha=0.4, colour=NA) +
+        geom_line(aes(y=Estimate)) +
+        facet_wrap(~region, scales="free", ncol=3) +
+        scale_colour_manual(values=pal_futurama()(12)) +
+        scale_fill_manual(values=pal_futurama(alpha = 0.3)(12)) +
+        labs(y=expression(paste("Radioactivity (kBq/cc)", sep="")),
+             x="Time (min)",
+             title = paste(sampleid, ":", checkdat$genotype[1]))
+
+}
+
+ids <- unique(simba_modeldata_sub$pet) #sample(unique(simba_modeldata$pet), 5)
+
+map(ids, ~check_some_fits(simba_modeldata_sub, .x))
+```
+
+
+# Model comparison
+
+Here we will do model comparison using the pareto smoothed importance sampling using the leave-one out criterion.
+This is embedded in the loo package:
+
+## Fixed genotype levels
+
+```{r}
+loo_3tc5kND_fixed <- readRDS("../DerivedData/3tc5kND_looic_fixed.rds")
+loo_3tc5kS_fixed <- readRDS("../DerivedData/fit4_looic_threetc5kS_fixed.rds")
+loo_3tc5kP_fixed <- readRDS("../DerivedData/fit4_looic_threetc5kP_fixed.rds")
+#checks predictive performance
+loo_compare(list("3tc5kND_fixed" =loo_3tc5kND_mixed, "3tc5kS_fixed"=loo_3tc5kS_mixed,"3tc5kP_fixed"=loo_3tc5kP_fixed))
+```
+
+other things that can be checked for modelfit criteria:
+
+```{r}
+plot <- plot(loo_3tc5kND_mixed)
+ggsave("loo3tc5kND.pdf", plot = plot, width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+#used to check R_hats  and effective sample size, posterior predictive checks
+plot <- pp_check(fit4_threetc5kND, ndraws = 100)
+ggsave("loondraws3tc5kND.pdf", plot = plot, width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+plot <- pp_check(fit4_threetc5kND, type = "intervals", x = "frame_mid")
+ggsave("looint3tc5kND.pdf", plot = plot, width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+plot <- pp_check(fit4_threetc5kND, type = "error_scatter_avg_vs_x", group = "frame_mid")
+ggsave("looerrsc3tc5kND.pdf", plot = plot, width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+plot <- pp_check(fit4_threetc5kND, type = "intervals_grouped", group = "proplow")
+ggsave("loointgroup3tc5kND.pdf", plot = plot, width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+pp_check(fit4_threetc5kS, type = "error_hist")
+pp_check(fit4_threetc5kS, type = "scatter_avg")
+pp_check(fit4_threetc5kS,type = "stat_2d")
+pp_check(fit4_threetc5kS, type="loo_pit_overlay")
+pp_check(fit4_threetc5kS, type = "loo_intervals")
+```
+
