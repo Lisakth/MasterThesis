@@ -3,10 +3,6 @@ title: "Munge"
 output: html_notebook
 ---
 
-# Aims
-
-Let's extract the data from the datasheets for the first set of Yale UCB-J data.
-
 # Libraries
 
 ```{r}
@@ -36,9 +32,8 @@ library(readxl)
 
 # Demographics
 
-Should i include tracer, diagnosis and secondary diagnosis, patient state (pre, post, test)
 ```{r}
-demog <- read_excel("/home/lisatjarks/Repositories/Yale_data/RawData/InjectionInfo/PETInjectionInformation.xlsx",
+demog <- read_excel(".../RawData/InjectionInfo/PETInjectionInformation.xlsx",
                     sheet = "all_protocols_combined") %>% 
   select(ID = PatientID,
          PET = InjectionID,
@@ -49,11 +44,11 @@ demog <- read_excel("/home/lisatjarks/Repositories/Yale_data/RawData/InjectionIn
          fP = free_fraction_number) %>% 
   mutate(InjRad_SUV = InjRad / Weight)
 
-saveRDS(demog, "/home/lisatjarks/Repositories/Yale_data/DerivedData/Data1_demographics.rds")
+saveRDS(demog, "../DerivedData/Data1_demographics.rds")
 ```
 
 ```{r}
-demog <- readRDS("/home/lisatjarks/Repositories/Yale_data/DerivedData/Data1_demographics.rds") %>%
+demog <- readRDS("../DerivedData/Data1_demographics.rds") %>%
   mutate(IDPET = paste(ID,PET,sep="_"))%>%
   group_by(IDPET) %>%
   nest(.key="demog")
@@ -64,7 +59,7 @@ demog <- readRDS("/home/lisatjarks/Repositories/Yale_data/DerivedData/Data1_demo
 
 ```{r}
 dat <- tibble(
-  filename = list.files("/home/lisatjarks/Repositories/Yale_data/RawData/all_data/", pattern="csv",
+  filename = list.files("../RawData/all_data/", pattern="csv",
                         full.names = T)) %>% 
   mutate(Type = case_when(
     str_detect(filename, "All_TACs_all") ~ "TAC",
@@ -75,7 +70,7 @@ dat <- tibble(
 ```
 
 ## Plasma (after 3min)
-the the last columns did not have a header anymore, so finding the actual amount of headers that we need (amount , in the last col +1)
+the last columns did not have a header anymore, so finding the actual amount of headers that we need (amount , in the last col +1)
 pasting the values in the next col
 same header structure as before, starting with v14
 
@@ -227,15 +222,6 @@ aifdat <- dat %>%
 Let's plot a couple to be sure
 
 ```{r}
-  
-aifdat %>% filter(ID == "DD191", PET=="12227") %>% 
-  unnest(aif) %>%
-  ggplot(aes(x=Time, y=AIF)) +
-  geom_point() +
-  geom_line() +
-  xlim(0,10)
-
-
 ggplot(aifdat$aif[[2]], aes(x=Time, y=AIF)) +
   geom_point() +
   geom_line() +
@@ -602,7 +588,7 @@ df_input <- input %>%
   })) %>% 
   select(-input_wrong)
 
-saveRDS(df_input, "/home/lisatjarks/Repositories/Yale_data/DerivedData/input.rds")
+saveRDS(df_input, "../DerivedData/input.rds")
 
 ```
 
@@ -1140,7 +1126,7 @@ modeldat <- tac_dur_weights %>%
 #                     group_by(ANALYSISID) %>%
 #                     nest(.key="tac_inside") %>%
 #                     ungroup()))
-saveRDS(modeldat, "/home/lisatjarks/Repositories/Yale_data/DerivedData/modeldat.rds")
+saveRDS(modeldat, "/../DerivedData/modeldat.rds")
 ```
 
 ```{r}
@@ -1204,7 +1190,7 @@ delay_fits <- modeldat %>%
                                                      timeStartEnd = c(0,5)))) #%>% 
   #mutate(inpshift = map_dbl(delayFit, c("par", "inpshift")))
 
-saveRDS(delay_fits, "/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_fits.rds")
+saveRDS(delay_fits, "../DerivedData/delay_fits.rds")
 ```
 
 
@@ -1237,7 +1223,7 @@ delay_fits <- modeldat %>%
   #   map_dbl(.x$fit, ~.x$par$inpshift)
   # }))
 
-saveRDS(delay_fits, "/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_fits.rds")
+saveRDS(delay_fits, "../DerivedData/delay_fits.rds")
 ```
 
 
@@ -1245,7 +1231,7 @@ saveRDS(delay_fits, "/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_f
 
 
 ```{r, fig.width=8, fig.height=8}
-delay_fits <- readRDS("/home/lisatjarks/Repositories/Yale_data/DerivedData/delay_fits.rds") %>% 
+delay_fits <- readRDS("../DerivedData/delay_fits.rds") %>% 
   select(IDPET, delayFit) %>%
   unnest(delayFit) %>%
   #mutate(IDPETID = paste(IDPET, ANALYSISID, sep="_")) %>%
@@ -1325,7 +1311,7 @@ modeldata_final <- delay_fits_median %>%
 ## add genotype
 
 ```{r}
-genotype <- read_excel("/home/lisatjarks/Repositories/Yale_data/RawData/Genotype_NRR.xlsx") %>%
+genotype <- read_excel("../RawData/Genotype_NRR.xlsx") %>%
   mutate(Genotype = ifelse(Genotype=="C/C", "HAB",ifelse(Genotype=="C/T","MAB",Genotype))) 
 diagnosis <- dat %>% 
   filter(Type=="TAC") %>% 
@@ -1382,7 +1368,7 @@ table(cleaned_modeldat$DIAGNOSIS)
 ## save
 
 ```{r}
-saveRDS(cleaned_modeldat, "/home/lisatjarks/Repositories/Yale_data/DerivedData/modeldata.rds")
+saveRDS(cleaned_modeldat, "../DerivedData/modeldata.rds")
 ```
 
 ###plots to check
@@ -1766,175 +1752,3 @@ for (i in unique(alldata$PROTOCOL)){
 ```
 
 looking at these fits, we decided to use their AIF data for the first 10 minutes, and then we calculate the AIF=PLASMA*PARENT
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ROI Sizes
-
-```{r}
-sum(is.na(tac$ROIsize))
-sum(!is.na(tac$ROIsize))
-testdata <- tac_new %>%
-  filter(is.na(ROIsize))
-table(testdata$Region)
-```
-
-
-
-
-
-
-
-```{r}
-roisizes <- tac_dur_weights %>% 
-  unnest(tac) %>%
-  ungroup() %>%
-  select(ID, PET, ANALYSISID, ROIsize, Region) %>% 
-  arrange(ID)
-
-naniar::vis_miss(roisizes)
-```
-This looks like the missing sizes are all within one individual.
-
-```{r}
-roisizes %>% 
-  group_by(ID, PET) %>% 
-  summarise(all_there = all(!is.na(ROIsize)))
-```
-
-Ok, so let's just use average ROI sizes.
-
-```{r}
-roisizes <- roisizes %>% 
-  group_by(ID) %>% 
-  mutate(missing = is.na(mean(ROIsize))) %>% 
-  filter(!missing) %>% 
-  select(-missing)
-
-naniar::vis_miss(roisizes)
-
-table(roisizes$ID, roisizes$Region)
-```
-
-Nice!
-
-Now let's calculate regional means
-
-```{r}
-mean_roisizes <- roisizes %>% 
-  group_by(Region) %>% 
-  summarise(RegSize = mean(ROIsize)) %>% 
-  mutate(logRegSize = log(RegSize),
-         logRegSize_c = logRegSize - mean(logRegSize))
-
-saveRDS(mean_roisizes, "../../DerivedData/Data2_mean_roisizes.rds")
-```
-
-
-
-
-
-<!-- # Just trying to understand the data -->
-
-<!-- ## Bolus: Baseline + post-dose -->
-
-<!-- ```{r} -->
-<!-- demog %>%  -->
-<!--   filter(ID=="RG189") -->
-
-<!-- bol_b_p <- modeldat_nested %>%  -->
-<!--   filter(ID == "RG189") -->
-
-
-<!-- bol_b_p %>%  -->
-<!--   select(ID, PET, State, tacs) %>%  -->
-<!--   unnest(tacs) %>%  -->
-<!--   select(ID, PET, State, t_tac, Frontal) %>%  -->
-<!--   ggplot(aes(x=t_tac, y=Frontal, colour=State)) +  -->
-<!--   geom_point() + -->
-<!--   geom_line() -->
-<!-- ``` -->
-
-
-
-<!-- ## Bolus+infusion: Baseline + post-dose -->
-
-<!-- ```{r} -->
-<!-- demog %>%  -->
-<!--   filter(ID=="SC392") -->
-
-<!-- bolinf_b_p <- modeldat_nested %>%  -->
-<!--   filter(ID == "SC392") -->
-
-
-<!-- bolinf_b_p %>%  -->
-<!--   select(ID, PET, State, tacs) %>%  -->
-<!--   unnest(tacs) %>%  -->
-<!--   select(ID, PET, State, t_tac, Frontal) %>%  -->
-<!--   ggplot(aes(x=t_tac, y=Frontal, colour=State)) +  -->
-<!--   geom_point() + -->
-<!--   geom_line() -->
-<!-- ``` -->
-
-
-<!-- ## Bolus+infusion: Displacement + post-dose -->
-
-<!-- ```{r} -->
-<!-- demog %>%  -->
-<!--   filter(ID=="SA746") -->
-
-<!-- bolinf_d_p <- modeldat_nested %>%  -->
-<!--   filter(ID == "SA746") -->
-
-
-<!-- bolinf_d_p %>%  -->
-<!--   select(ID, PET, State, tacs) %>%  -->
-<!--   unnest(tacs) %>%  -->
-<!--   select(ID, PET, State, t_tac, Frontal) %>%  -->
-<!--   ggplot(aes(x=t_tac, y=Frontal, colour=State, group=PET)) +  -->
-<!--   geom_point() + -->
-<!--   geom_line() -->
-<!-- ``` -->
