@@ -21,22 +21,7 @@ library(loo)
 # Data
 
 ```{r}
-simba_modeldata <- readRDS("../DerivedData/simba_modeldata.rds") %>% 
-  filter(pet != "sub-C32_ses-1") %>% # Noted as looking weird (note Granville)
-  filter(pet != "sub-C32_ses-2") %>% # Noted as looking weird from images
-  filter(pet != "sub-C58_ses-1") %>% # Chopped off CBL
-  filter(pet != "sub-C56_ses-2") %>% # Noted as looking weird from images
-  filter(pet != "sub-C31_ses-2") # Extremely high TAC: weird from data def report
-
-simba_modeldata_sub <- simba_modeldata %>% 
-  filter(pet != "sub-C32_ses-1") %>% # Noted as looking weird (note Granville)
-  filter(pet != "sub-C32_ses-2") %>% # Noted as looking weird from images
-  filter(pet != "sub-C58_ses-1") %>% # Chopped off CBL
-  filter(pet != "sub-C56_ses-2") %>% # Noted as looking weird from images
-  filter(pet != "sub-C31_ses-2") %>% # Extremely high TAC: weird from data def report
-  filter(sub == "C03" | sub == "C06" | sub == "C11"| sub == "C38"| sub == "C50"
-         | sub == "C13"| sub == "C26"| sub == "C47"| sub == "C52"| sub == "B26"
-         | sub == "B06"| sub == "C33"| sub == "B20"| sub == "C42")  # 5 of each HAB,MAB,LAB (C33 has two measurements)
+simba_modeldata <- readRDS("../DerivedData/simba_modeldata.rds") 
 ```
 
 ```{r}
