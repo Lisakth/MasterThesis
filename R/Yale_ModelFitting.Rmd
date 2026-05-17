@@ -35,26 +35,6 @@ simba_modeldata <- readRDS("../DerivedData/Yale_simba_modeldata.rds") %>%
            forcats::fct_relevel("Frontal"))
 ```
 
-```{r}
-simba_modeldata_sub <- simba_modeldata %>% 
-  filter(pet=="AS525_12519" | pet == "AS525_12520" | #HAB, HC
-           pet == "GN773_12604"| pet == "GN773_12605"| #MAB, HC
-           pet == "LP272_13429"| pet == "LP272_13480"| #MAB, ALC
-           pet == "MS932_20451"| pet == "MS932_20450"| #HAB, PTSD
-           #pet == "CC897_6755"| #NA, MDD
-           pet == "TD049_8689"| #MAB, MDD
-           pet == "JS653_9176"| #MAB, HC
-           pet == "MJ893_8084" #HAB, HC
-           ) %>% 
-  ungroup()
-```
-
-```{r}
-simba_modeldata_LPS <- simba_modeldata %>%
-  filter(LPSpair) 
-```
-
-
 
 # STAN Models
 
